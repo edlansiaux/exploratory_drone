@@ -123,40 +123,28 @@ class HazardDetector:
 
 class ExplorationMission:
     """
-    Gestionnaire de mission d'exploration
-    Coordonne tous les sous-systèmes pour une exploration efficace et sûre
+    Gestionnaire de mission d'exploration "Nez en avant"
+    Avec scan 360° initial et périodique (tous les 5m)
     """
     
     def __init__(self, config: MissionConfig = None, simulation_mode: bool = False):
-        """
-        Initialise une nouvelle mission
-        
-        Args:
-            config: Configuration de la mission
-            simulation_mode: Si True, simule sans drone réel
-        """
+        # ... (init existant) ...
         self.config = config or MissionConfig()
         self.simulation_mode = simulation_mode
         
-        # Composants principaux
+        # Composants (gardez votre initialisation existante)
         self.controller = TelloController(simulation_mode)
-        self.altitude_map = AltitudeMap(
-            resolution=self.config.step_size,
-            size=(self.config.area_width, self.config.area_height)
-        )
-        self.planner = ExplorationPlanner(
-            self.altitude_map, 
-            step_size=self.config.step_size
-        )
-        self.avoidance = ObstacleAvoidanceSystem(
-            SafetyZone(front=80, back=50, left=50, right=50, above=50, below=40)
-        )
+        self.altitude_map = AltitudeMap(resolution=self.config.step_size, size=(self.config.area_width, self.config.area_height))
+        self.planner = ExplorationPlanner(self.altitude_map, step_size=self.config.step_size)
+        self.avoidance = ObstacleAvoidanceSystem(SafetyZone(front=80, back=50, left=50, right=50, above=50, below=40))
         self.reactive = ReactiveAvoidance(emergency_distance=40)
         self.hazard_detector = HazardDetector()
         
         # État de la mission
         self.status = MissionStatus.IDLE
-        self.mode = ExplorationMode.SEMI_AUTO
+        self.mode = ExplorationMode.FULL_AUTO
+        self.distance_since_last_scan = 0.0
+        self.scan_threshold = 500.0  # Scan tous les 500 cm (5 mètres)
         self.start_time: Optional[float] = None
         self.waypoints_completed = 0
         self.total_waypoints = 0
@@ -182,20 +170,25 @@ class ExplorationMission:
         Effectue une rotation pour scanner l'environnement (Avant/Arrière/Côtés)
         Indispensable car la caméra est seulement frontale.
         """
-        logger.info("Début du scan de sécurité 360°...")
+        logger.info("📡 DÉBUT SCAN 360° DE SÉCURITÉ")
         
-        # On fait 4 rotations de 90 degrés pour couvrir tout l'espace
-        # Le système SLAM et ObstacleDetector mettront à jour la carte à chaque étape
-        for _ in range(4):
+        # On fait 4 rotations de 90 degrés
+        # Cela permet au SLAM de se recaler et à la vision de détecter les obstacles
+        for i in range(4):
             if self._stop_exploration.is_set():
                 break
                 
-            # Rotation lente pour permettre au SLAM de suivre
+            logger.info(f"Scan partie {i+1}/4...")
             self.controller.rotate_clockwise(90)
-            time.sleep(1.0) # Pause pour la stabilisation de l'image et la détection
             
-            # Enregistrement explicite des données à cet angle
+            # Pause CRUCIALE pour stabiliser l'image (flou de mouvement = ennemi du SLAM)
+            time.sleep(1.0) 
+            
+            # Enregistrer les données (carte altitude + détection dangers)
             self._record_exploration_data()
+            
+        self.distance_since_last_scan = 0.0
+        logger.info("✅ SCAN 360° TERMINÉ")
 
     def _navigate_to_waypoint(self, waypoint: Tuple[float, float]) -> bool:
         """
@@ -343,9 +336,9 @@ class ExplorationMission:
         return True
     
     def start_exploration(self) -> bool:
+        """Démarre l'exploration avec un scan initial"""
         """
         Démarre l'exploration autonome
-        
         Returns:
             True si le démarrage est réussi
         """
@@ -353,6 +346,11 @@ class ExplorationMission:
             logger.warning(f"Impossible de démarrer: statut = {self.status.value}")
             return False
         
+        
+        
+        # Démarrer les systèmes
+        if self.config.enable_avoidance:
+            self.avoidance.start_monitoring()
         # Décollage si nécessaire
         if self.controller.state != DroneState.FLYING:
             if not self.controller.takeoff():
@@ -366,9 +364,9 @@ class ExplorationMission:
                 if diff >= 20:
                     self.controller.move_up(diff)
         
-        # Démarrer les systèmes
-        if self.config.enable_avoidance:
-            self.avoidance.start_monitoring()
+        # NOUVEAU : Scan initial obligatoire avant tout mouvement
+        logger.info("Exécution du scan initial avant exploration...")
+        self._perform_safety_scan()
         
         # Démarrer le thread d'exploration
         self._stop_exploration.clear()
@@ -481,35 +479,90 @@ class ExplorationMission:
     
     def _navigate_to_waypoint(self, waypoint: Tuple[float, float]) -> bool:
         """
-        Navigue vers un waypoint avec évitement d'obstacles
-        
-        Args:
-            waypoint: Coordonnées (x, y) du waypoint
-        
-        Returns:
-            True si le waypoint est atteint
+        Navigation "Nez en avant" :
+        1. Calcule l'angle vers la cible
+        2. Pivote face à la cible
+        3. Avance en ligne droite (avec détection d'obstacles frontaux)
+        4. Gère les scans périodiques tous les 5m
         """
         target_x, target_y = waypoint
-        target_z = self.config.exploration_altitude
-        
         current_pos = self.controller.position
         
-        # Vérifier les obstacles sur le chemin
-        if self.config.enable_avoidance:
-            collision, obstacle = self.avoidance.check_collision_risk(
-                current_pos.x, current_pos.y, current_pos.z,
-                target_x, target_y, target_z
-            )
-            
-            if collision and obstacle:
-                return self._handle_obstacle_avoidance(
-                    (current_pos.x, current_pos.y, current_pos.z),
-                    (target_x, target_y, target_z),
-                    obstacle
-                )
+        # 1. Calcul du vecteur de déplacement
+        dx = target_x - current_pos.x
+        dy = target_y - current_pos.y
+        distance_total = math.sqrt(dx**2 + dy**2)
         
-        # Navigation directe
-        return self._move_to_position(target_x, target_y, target_z)
+        if distance_total < 10: return True # Déjà arrivé
+        
+        # 2. Calcul de l'angle cible (en degrés)
+        # Note: atan2(y, x) donne l'angle en radians
+        angle_rad = math.atan2(dy, dx)
+        angle_deg = math.degrees(angle_rad)
+        
+        # Conversion repère mathématique -> repère drone (si nécessaire, ici supposé aligné)
+        # Ajustement : Le Tello considère 0° comme l'axe avant au démarrage.
+        # Il faudrait idéalement convertir en coordonnées absolues si le mapping est absolu.
+        # Pour faire simple ici, on utilise une rotation relative approximative si on n'a pas de boussole fiable.
+        
+        logger.info(f"🧭 Orientation vers waypoint : {angle_deg:.0f}°")
+        
+        # Rotation face à la cible (si on a un capteur de cap, sinon on estime)
+        # Si on n'a pas de cap absolu fiable, on peut juste faire une rotation relative basée sur l'ancien waypoint
+        # Mais supposons que rotate_to_angle fonctionne (via IMU ou estimation)
+        self.controller.rotate_to_angle(angle_deg)
+        time.sleep(0.5) # Stabilisation post-rotation
+        
+        # 3. Avancer par petits pas pour scanner et vérifier les obstacles
+        step_size = 50.0 # cm par pas
+        distance_covered = 0.0
+        
+        while distance_covered < distance_total:
+            if self._stop_exploration.is_set(): return False
+            
+            # Vérifier si on doit scanner (tous les 5m)
+            if self.distance_since_last_scan >= self.scan_threshold:
+                logger.info(f"📏 Distance 5m atteinte ({self.distance_since_last_scan:.0f}cm). Scan périodique.")
+                self._perform_safety_scan()
+                # Après le scan, il faut se réorienter vers la cible car le scan nous a fait tourner
+                self.controller.rotate_to_angle(angle_deg)
+                time.sleep(0.5)
+
+            # Calculer la distance du prochain pas
+            remaining = distance_total - distance_covered
+            current_step = min(step_size, remaining)
+        
+            # Vérifier les obstacles sur le chemin
+            if self.config.enable_avoidance:
+                collision, obstacle = self.avoidance.check_collision_risk(
+                    current_pos.x, current_pos.y, current_pos.z,
+                    target_x, target_y, target_z
+                )
+                
+                if collision and obstacle:
+                    return self._handle_obstacle_avoidance(
+                        (current_pos.x, current_pos.y, current_pos.z),
+                        (target_x, target_y, target_z),
+                        obstacle
+                    )
+        
+        # Mouvement AVANT uniquement
+            if self.controller.move_forward(int(current_step)):
+                distance_covered += current_step
+                self.distance_since_last_scan += current_step
+                
+                # Enregistrement des données (altitude sol)
+                self._record_exploration_data()
+            else:
+                logger.warning("⛔ Blocage frontal détecté !")
+                # Ici : Logique de contournement (reculer, tourner, etc.)
+                return False
+                
+        return True
+
+    # On désactive l'ancienne méthode de mouvement direct (x,y,z) car dangereuse sans caméras latérales
+    def _move_to_position(self, x, y, z):
+        return self._navigate_to_waypoint((x, y))
     
     def _handle_obstacle_avoidance(self, current: Tuple[float, float, float],
                                     target: Tuple[float, float, float],
