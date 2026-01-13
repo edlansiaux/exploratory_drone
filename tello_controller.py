@@ -239,34 +239,42 @@ class TelloController:
             logger.error(f"Erreur mouvement gauche: {e}")
             return False
     
-    # Ajoutez ceci dans la classe TelloController
-    
-    def get_heading(self) -> float:
-        """
-        Retourne l'orientation actuelle du drone en degrés (0 = Nord/Départ, + = Horaire)
-        Ceci est une estimation basée sur l'accumulation des commandes de rotation.
-        """
-        # Note: Pour une vraie précision, il faudrait le capteur IMU du drone (yaw)
-        # Ici on simule ou on récupère l'état estimé si disponible
-        if self.drone and not self.simulation_mode:
-            return self.drone.get_yaw()
-        return 0.0 # En simulation, il faudrait tracker l'angle accumulé
 
-    def rotate_to_angle(self, target_angle: float):
+    
+    def get_heading(self) -> int:
         """
-        Pivote le drone vers un angle cible absolu
+        Récupère l'orientation actuelle (Yaw) du drone en degrés.
+        Retourne 0 si non disponible ou en simulation.
+        """
+        if self.simulation_mode:
+            # En simulation, on pourrait tracker l'angle, mais pour l'instant on retourne 0
+            # ou une valeur simulée si vous avez étendu la simulation
+            return 0
+            
+        if self.drone:
+            try:
+                # djitellopy retourne l'attitude sous forme de dictionnaire ou attribut
+                return self.drone.get_yaw()
+            except:
+                return 0
+        return 0
+
+    def rotate_to_angle(self, target_angle: float) -> bool:
+        """
+        Pivote le drone pour s'aligner sur un angle absolu donné (en degrés).
         """
         current_yaw = self.get_heading()
-        diff = target_angle - current_yaw
         
-        # Normalisation entre -180 et 180
-        diff = (diff + 180) % 360 - 180
+        # Calcul de la différence la plus courte (-180 à 180)
+        diff = (target_angle - current_yaw + 180) % 360 - 180
         
-        if abs(diff) > 5: # Zone morte de 5 degrés
-            if diff > 0:
-                self.rotate_clockwise(int(diff))
-            else:
-                self.rotate_counter_clockwise(int(abs(diff)))
+        if abs(diff) < 5: # Zone morte de 5°
+            return True
+            
+        if diff > 0:
+            return self.rotate_clockwise(int(diff))
+        else:
+            return self.rotate_counter_clockwise(int(abs(diff)))
                 
     def move_right(self, distance: int = DEFAULT_MOVE_DISTANCE) -> bool:
         """
