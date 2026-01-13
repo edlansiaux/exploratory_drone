@@ -353,7 +353,7 @@ class ObstacleAvoidanceSystem:
                                        target_pos: Tuple[float, float, float],
                                        obstacle: DetectedObstacle,
                                        strategy: AvoidanceStrategy) -> List[Tuple[float, float, float]]:
-                                           """
+        """
         Calcule les waypoints pour contourner un obstacle
         
         Args:
