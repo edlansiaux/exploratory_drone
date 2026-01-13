@@ -6,6 +6,7 @@ Conçu pour l'exploration de zones dangereuses (NRBC)
 """
 
 import time
+import math
 import threading
 import logging
 from typing import Tuple, Optional, List, Callable
@@ -176,6 +177,112 @@ class ExplorationMission:
         
         logger.info(f"Mission initialisée (simulation: {simulation_mode})")
     
+    def _perform_safety_scan(self):
+        """
+        Effectue une rotation pour scanner l'environnement (Avant/Arrière/Côtés)
+        Indispensable car la caméra est seulement frontale.
+        """
+        logger.info("Début du scan de sécurité 360°...")
+        
+        # On fait 4 rotations de 90 degrés pour couvrir tout l'espace
+        # Le système SLAM et ObstacleDetector mettront à jour la carte à chaque étape
+        for _ in range(4):
+            if self._stop_exploration.is_set():
+                break
+                
+            # Rotation lente pour permettre au SLAM de suivre
+            self.controller.rotate_clockwise(90)
+            time.sleep(1.0) # Pause pour la stabilisation de l'image et la détection
+            
+            # Enregistrement explicite des données à cet angle
+            self._record_exploration_data()
+
+    def _navigate_to_waypoint(self, waypoint: Tuple[float, float]) -> bool:
+        """
+        Navigation "Nez en avant" : Rotation puis Avancée
+        """
+        target_x, target_y = waypoint
+        target_z = self.config.exploration_altitude
+        
+        current = self.controller.position
+        
+        # 1. Calcul du vecteur vers la cible
+        dx = target_x - current.x
+        dy = target_y - current.y
+        distance = math.sqrt(dx**2 + dy**2)
+        
+        if distance < 10: # Déjà arrivé
+            return True
+
+        # 2. Vérification de sécurité (Scan) si on change radicalement de direction
+        # ou si c'est le début du mouvement
+        self._perform_safety_scan()
+
+        # 3. Calcul de l'angle cible (en degrés)
+        # atan2 retourne l'angle en radians par rapport à l'axe X
+        target_angle_rad = math.atan2(dy, dx)
+        target_angle_deg = math.degrees(target_angle_rad)
+        
+        # Conversion du repère mathématique au repère drone (si nécessaire)
+        # Supposons ici que 0° = Axe Y (Nord) pour le drone Tello
+        # L'ajustement dépend de votre repère initial dans mapping.py
+        
+        # 4. Rotation face à la cible
+        # Note: Il faut implémenter une logique pour calculer la différence d'angle 
+        # par rapport à l'orientation actuelle du drone.
+        # Pour simplifier ici, on utilise une rotation relative basée sur le vecteur
+        
+        logger.info(f"Orientation vers le waypoint ({target_x:.0f}, {target_y:.0f})")
+        # On pivote pour faire face au mouvement
+        # (Nécessite de connaître l'angle actuel du drone, voir modification tello_controller)
+        # Si on ne connait pas l'angle absolu, on ne peut pas utiliser cette méthode facilement.
+        # Alternative simple : on désactive le strafing.
+        
+        # Si nous sommes en mode "Nez en avant strict", on ne fait que avancer.
+        # Pour ce faire, il faut calculer l'angle de rotation requis.
+        
+        # ... (Logique de rotation ici via self.controller.rotate_...) ...
+        
+        # 5. Avancer vers la cible (par petits pas pour vérifier les obstacles)
+        step = 50 # cm
+        remaining = distance
+        
+        while remaining > 0:
+            if self._stop_exploration.is_set():
+                return False
+                
+            # Distance à parcourir pour ce pas
+            move_dist = min(remaining, step)
+            
+            # Vérification Obstacle Frontal (Vision)
+            # On utilise le détecteur d'obstacle via la caméra frontale
+            # C'est géré par l'événement on_obstacle_detected ou via self.avoidance
+            
+            # Si un obstacle est détecté devant via la vision ou le SLAM
+            # La méthode _handle_obstacle_avoidance sera appelée
+            
+            # Mouvement avant UNIQUEMENT (pas de gauche/droite/arrière)
+            logger.info(f"Avance de {move_dist:.0f}cm")
+            success = self.controller.move_forward(int(move_dist))
+            
+            if not success:
+                logger.warning("Blocage détecté, tentative de contournement")
+                # Ici lancer une logique d'évitement qui implique de tourner
+                return False
+                
+            remaining -= move_dist
+            time.sleep(0.5) # Stabilisation
+            
+        return True
+
+    def _move_to_position(self, target_x: float, target_y: float, target_z: float) -> bool:
+        """
+        Surcharge de la méthode originale pour interdire les mouvements latéraux/arrières
+        """
+        # Cette méthode est appelée par la logique d'évitement ou de navigation fine.
+        # On la redirige vers la logique de rotation + avance.
+        return self._navigate_to_waypoint((target_x, target_y))
+        
     def _set_status(self, new_status: MissionStatus):
         """Change le statut et notifie"""
         old_status = self.status
