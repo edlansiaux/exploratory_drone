@@ -1,0 +1,22 @@
+# Dépendances pour le système d'exploration Tello EDU
+# Installation: pip install -r requirements.txt
+
+# Contrôle du drone Tello
+djitellopy>=2.4.0
+
+# Calculs scientifiques et matrices
+numpy>=1.21.0
+
+# Vision par ordinateur et SLAM
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+
+# Interface graphique
+pillow>=9.0.0
+
+# Visualisation (optionnel)
+matplotlib>=3.5.0
+
+# Export de données (optionnel)
+# pandas>=1.3.0
+
