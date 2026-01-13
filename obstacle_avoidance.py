@@ -174,6 +174,8 @@ class ObstacleAvoidanceSystem:
             self._check_mobile_obstacles()
             time.sleep(0.1)  # 10 Hz
     
+
+    
     def _cleanup_old_obstacles(self):
         """Supprime les obstacles non détectés récemment"""
         current_time = time.time()
@@ -351,7 +353,7 @@ class ObstacleAvoidanceSystem:
                                        target_pos: Tuple[float, float, float],
                                        obstacle: DetectedObstacle,
                                        strategy: AvoidanceStrategy) -> List[Tuple[float, float, float]]:
-        """
+                                           """
         Calcule les waypoints pour contourner un obstacle
         
         Args:
@@ -364,7 +366,7 @@ class ObstacleAvoidanceSystem:
             Liste de waypoints pour l'évitement
         """
         waypoints = []
-        avoidance_distance = 100  # Distance de contournement en cm
+        avoidance_distance = 120  # Distance de contournement en cm
         
         if strategy == AvoidanceStrategy.STOP:
             # Rester sur place et attendre
