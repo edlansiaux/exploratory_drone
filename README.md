@@ -1,373 +1,350 @@
-# 🚁 Système d'Exploration Tello EDU pour Zones NRBC
+# 🚁 Tello Explorer - Système d'Exploration Autonome
 
-Système complet de contrôle et d'exploration autonome pour drone DJI Tello EDU, conçu pour l'exploration de zones potentiellement dangereuses (incidents thermiques, nucléaires, radiologiques, biologiques ou chimiques) avant l'envoi de personnel humain.
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## 📋 Fonctionnalités
+Système complet d'exploration autonome pour drone **DJI Tello EDU**, conçu pour l'inspection de bâtiments endommagés (incendies, explosions, catastrophes naturelles).
 
-### 🎮 Contrôle Manuel
-- ✅ Décollage / Atterrissage
-- ✅ Déplacement gauche/droite (50cm par défaut, configurable)
-- ✅ Montée/descente (50cm par défaut, configurable)
-- ✅ Avancer/reculer
-- ✅ Rotation horaire/anti-horaire
-- ✅ Retour automatique au point de départ
-- ✅ Arrêt d'urgence
+## 🎯 Fonctionnalités
 
-### 🤖 Exploration Autonome
-- ✅ Pattern de balayage en serpent (snake)
-- ✅ Pattern en spirale
-- ✅ Gestion automatique des waypoints
-- ✅ Limites de temps et de batterie
-- ✅ Pause/reprise de mission
+- **Navigation Autonome** : Patterns d'exploration (snake, spiral, room_search)
+- **Évitement d'Obstacles** : Détection et contournement temps réel (<100ms)
+- **Cartographie Duale** : Cartes spatiale + thermique simultanées
+- **Détection Thermique** : Identification zones chaudes et foyers d'incendie
+- **Sécurité Multi-Couches** : Réflexes, évitement planifié, scans 360°
+- **Mode Simulation** : Test complet sans matériel
 
-### 🗺️ Cartographie
-- ✅ Création de carte d'altitude en temps réel
-- ✅ Enregistrement de tous les points explorés
-- ✅ Statistiques d'altitude (min, max, moyenne)
-- ✅ Visualisation ASCII de la carte
-- ✅ Export JSON et CSV
+## 📁 Structure du Projet
 
-### 🚧 Évitement d'Obstacles
-- ✅ Détection d'obstacles statiques
-- ✅ Détection d'obstacles mobiles avec prédiction de trajectoire
-- ✅ Stratégies d'évitement multiples (contournement, passage au-dessus/dessous)
-- ✅ Zone de sécurité configurable
-- ✅ Réaction réflexe pour dangers immédiats
+```
+tello_explorer_optimized/
+├── tello_controller.py      # Contrôle drone et navigation
+├── vision.py                # Traitement vidéo et détection
+├── mapping.py               # Cartographie duale (altitude + thermique)
+├── obstacle_avoidance.py    # Système d'évitement d'obstacles
+├── exploration.py           # Orchestration mission complète
+├── demo_exploration_complete.ipynb  # Notebook de démonstration
+├── main.py                  # Point d'entrée rapide
+├── requirements.txt         # Dépendances Python
+└── README.md               # Cette documentation
+```
 
-### 📹 Vision par Ordinateur (NOUVEAU)
-- ✅ Flux vidéo en temps réel depuis la caméra du drone
-- ✅ Détection d'obstacles par analyse d'image
-- ✅ Extraction de features (ORB)
-- ✅ Estimation de distance des obstacles
-- ✅ Classification des obstacles (mur, personne, objet, sol, plafond)
-
-### 🧭 SLAM Visuel (NOUVEAU)
-- ✅ Odométrie visuelle (estimation du mouvement)
-- ✅ Cartographie 3D avec landmarks
-- ✅ Grille d'occupation 2D
-- ✅ Keyframes pour optimisation
-- ✅ Trajectoire temps réel
-- ✅ Export de carte SLAM
-
-### 🖥️ Interface Graphique (NOUVEAU)
-- ✅ Affichage du flux vidéo en temps réel
-- ✅ Visualisation de la carte SLAM
-- ✅ Overlay des obstacles détectés
-- ✅ Affichage des features
-- ✅ Contrôles interactifs
-- ✅ Indicateurs de télémétrie
-- ✅ Raccourcis clavier
-
-### ☢️ Détection de Dangers (Simulation)
-- ✅ Zones thermiques
-- ✅ Zones radioactives
-- ✅ Zones chimiques
-- ✅ Alertes en temps réel
-
-## 🛠️ Installation
+## 🚀 Installation
 
 ### Prérequis
-- Python 3.8+
-- Drone DJI Tello EDU
-- Connexion WiFi au drone
+
+- Python 3.8 ou supérieur
+- Drone DJI Tello EDU (optionnel avec mode simulation)
 
 ### Installation des dépendances
 
 ```bash
-cd tello_explorer
 pip install -r requirements.txt
 ```
 
-## 🚀 Utilisation
-
-### Interface Graphique (Recommandé)
+### Vérification de l'installation
 
 ```bash
-# Mode simulation (sans drone)
-python gui.py --simulation
-
-# Mode réel (avec drone connecté)
-python gui.py
+python main.py --test
 ```
 
-### Interface en Ligne de Commande
+## 💻 Utilisation Rapide
 
-```bash
-# Mode simulation (sans drone)
-python main.py --simulation
-
-# Mode réel (avec drone)
-python main.py
-```
-
-### Avec initialisation automatique
-
-```bash
-python main.py --simulation --auto-init
-```
-
-## 📖 Guide des Commandes
-
-### Initialisation
-```
-init          - Initialise le système
-connect       - Connecte au drone
-disconnect    - Déconnecte du drone
-```
-
-### Contrôle Manuel
-```
-takeoff       - Décollage
-land          - Atterrissage
-up [dist]     - Monter (défaut: 50cm)
-down [dist]   - Descendre (défaut: 50cm)
-left [dist]   - Gauche (défaut: 50cm)
-right [dist]  - Droite (défaut: 50cm)
-forward [dist]- Avancer (défaut: 50cm)
-back [dist]   - Reculer (défaut: 50cm)
-rotate left|right [angle] - Rotation (défaut: 90°)
-```
-
-### Exploration Automatique
-```
-config [param] [value] - Voir/modifier la configuration
-prepare       - Préparer la mission
-start         - Démarrer l'exploration
-pause         - Mettre en pause
-resume        - Reprendre
-stop          - Arrêter et atterrir
-home          - Retour au point de départ
-```
-
-### Visualisation
-```
-status        - État du drone
-map           - Afficher la carte
-report        - Rapport complet
-live [on|off] - Affichage en direct
-```
-
-### Simulation d'Obstacles
-```
-obstacle <x> <y> <z>              - Obstacle fixe
-mobile <x> <y> <z> <vx> <vy> <vz> - Obstacle mobile
-hazard <x> <y> <z> <type> <intensity> - Zone de danger
-```
-
-### Urgence
-```
-emergency     - ARRÊT D'URGENCE IMMÉDIAT
-```
-
-### Export
-```
-export [path] - Exporter les résultats
-```
-
-## ⚙️ Configuration
-
-Paramètres modifiables via la commande `config`:
-
-| Paramètre | Description | Défaut |
-|-----------|-------------|--------|
-| width | Largeur de la zone (cm) | 500 |
-| height | Hauteur de la zone (cm) | 500 |
-| altitude | Altitude d'exploration (cm) | 120 |
-| step | Pas d'exploration (cm) | 50 |
-| pattern | Pattern (snake/spiral) | snake |
-| duration | Durée max (s) | 600 |
-| battery | Batterie min (%) | 20 |
-
-Exemple:
-```
-config width 300
-config pattern spiral
-config altitude 150
-```
-
-## 🖥️ Interface Graphique
-
-L'interface graphique (`gui.py`) offre une vue complète du système:
-
-### Panneau Vidéo (Gauche)
-- Flux vidéo en temps réel de la caméra du drone
-- Overlay des obstacles détectés (boîtes colorées selon la distance)
-- Affichage des features ORB extraites
-- Informations FPS et mode
-
-### Panneau Carte SLAM (Droite)
-- Carte 2D avec landmarks détectés
-- Trajectoire du drone en temps réel
-- Grille d'occupation (zones libres/occupées)
-- Position et orientation du drone
-- Zoom et déplacement avec la souris
-
-### Raccourcis Clavier
-
-| Touche | Action |
-|--------|--------|
-| Espace | Décollage |
-| Échap | Atterrissage |
-| Entrée | URGENCE |
-| W / ↑ | Avancer |
-| S / ↓ | Reculer |
-| A / ← | Gauche |
-| D / → | Droite |
-| Q | Monter |
-| E | Descendre |
-| Z | Rotation gauche |
-| C | Rotation droite |
-
-## 📊 Structure des Fichiers
-
-```
-tello_explorer/
-├── gui.py               # Interface graphique (vidéo + carte SLAM)
-├── main.py              # Interface CLI interactive
-├── exploration.py       # Gestionnaire de mission
-├── tello_controller.py  # Contrôle bas niveau du drone
-├── mapping.py           # Cartographie et planification
-├── obstacle_avoidance.py# Système d'évitement
-├── vision.py            # Flux vidéo et détection d'obstacles
-├── visual_slam.py       # SLAM visuel et odométrie
-├── examples.py          # Exemples d'utilisation
-├── requirements.txt     # Dépendances Python
-└── README.md            # Documentation
-```
-
-## 🔧 Architecture du Code
-
-### TelloController
-Gère les commandes bas niveau du drone:
-- Connexion/déconnexion
-- Mouvements de base
-- Télémétrie
-- Suivi de position estimée
-
-### AltitudeMap
-Gère la cartographie:
-- Grille d'altitude
-- Points d'exploration
-- Liste des obstacles
-- Export des données
-
-### ExplorationPlanner
-Planifie l'exploration:
-- Génération de patterns (snake, spiral)
-- Gestion des waypoints
-- Calcul de la progression
-
-### ObstacleAvoidanceSystem
-Gère l'évitement d'obstacles:
-- Détection et suivi
-- Prédiction de trajectoire (obstacles mobiles)
-- Stratégies d'évitement
-- Zone de sécurité
-
-### VideoStream (NOUVEAU)
-Gère le flux vidéo:
-- Capture depuis le drone ou webcam
-- Génération de frames synthétiques (simulation)
-- Buffer de frames pour traitement
-
-### ObstacleDetector (NOUVEAU)
-Détection d'obstacles par vision:
-- Analyse de contours
-- Estimation de profondeur par flou
-- Classification des obstacles
-- Estimation de distance
-
-### FeatureExtractor (NOUVEAU)
-Extraction de features pour SLAM:
-- Détecteur ORB (Oriented FAST and Rotated BRIEF)
-- Matching de features entre frames
-- Suivi des points d'intérêt
-
-### VisualOdometry (NOUVEAU)
-Odométrie visuelle:
-- Estimation du mouvement entre frames
-- Calcul de la matrice essentielle
-- Récupération de la pose (rotation + translation)
-
-### VisualSLAM (NOUVEAU)
-SLAM visuel complet:
-- Gestion des landmarks 3D
-- Création de keyframes
-- Grille d'occupation 2D
-- Fusion des données visuelles et de navigation
-
-### ExplorationMission
-Coordonne tous les composants:
-- Gestion de l'état de mission
-- Boucle d'exploration
-- Callbacks et événements
-
-## 📈 Exemple de Mission
+### Mode Simulation (sans drone)
 
 ```python
 from exploration import ExplorationMission, MissionConfig
 
-# Configuration
+# Configuration mission
 config = MissionConfig(
-    area_width=400,
-    area_height=400,
-    exploration_altitude=100,
-    step_size=50,
-    pattern="snake"
+    area_width=300,           # Zone 3m x 3m
+    area_height=300,
+    exploration_altitude=100, # Vol à 1m
+    pattern="snake"           # Pattern serpent
 )
 
-# Création de la mission
+# Création mission en mode simulation
 mission = ExplorationMission(config, simulation_mode=True)
 
-# Préparation
+# Préparation et lancement
 mission.prepare_mission()
-
-# Ajout d'obstacles simulés
-mission.add_simulated_obstacle(100, 50, 100, is_mobile=False)
-mission.add_simulated_obstacle(0, 100, 100, is_mobile=True, velocity=(10, 5, 0))
-
-# Démarrage
 mission.start_exploration()
 
-# ... attendre ...
+# Attente (la mission s'exécute en background)
+import time
+time.sleep(20)
 
-# Arrêt et export
+# Arrêt et résultats
 mission.stop_exploration()
-mission.export_results("mission_results")
+mission.display_map()
+print(mission.get_mission_report())
 ```
 
-## ⚠️ Sécurité
+### Mode Réel (avec drone)
 
-### Recommandations
-1. **Toujours** tester en mode simulation d'abord
-2. Maintenir un contact visuel avec le drone
-3. Voler dans un espace dégagé
-4. Vérifier la batterie avant chaque vol
-5. Connaître l'emplacement du bouton d'arrêt d'urgence
+```python
+from exploration import ExplorationMission, MissionConfig
 
-### Limites du Tello EDU
-- Distance de contrôle: ~100m
-- Altitude max: ~30m (limité par défaut)
-- Autonomie: ~13 minutes
-- Vent max: ~10 m/s
+config = MissionConfig(
+    area_width=500,
+    area_height=500,
+    exploration_altitude=120,
+    min_battery=20,           # Sécurité batterie
+    max_duration=300          # 5 minutes max
+)
 
-## 🔮 Améliorations Futures
+mission = ExplorationMission(config, simulation_mode=False)
+mission.prepare_mission()
+mission.start_exploration()
+```
 
-- [x] ~~Intégration flux vidéo (OpenCV)~~
-- [x] ~~SLAM visuel pour cartographie plus précise~~
-- [x] ~~Détection d'obstacles par vision~~
-- [x] ~~Interface graphique (GUI)~~
-- [ ] Support de capteurs NRBC réels
-- [ ] Communication multi-drones
-- [ ] Planification de trajectoire A*
-- [ ] Optimisation du graphe SLAM (bundle adjustment)
-- [ ] Détection de personnes (YOLO/MobileNet)
-- [ ] Reconnaissance de QR codes/ArUco markers
+### Ligne de commande
+
+```bash
+# Mode simulation avec paramètres par défaut
+python main.py --simulation
+
+# Mode réel
+python main.py
+
+# Personnalisation
+python main.py --simulation --width 400 --height 400 --pattern spiral --duration 30
+```
+
+## ⚙️ Configuration
+
+### Paramètres de Mission
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `area_width` | 500 | Largeur zone exploration (cm) |
+| `area_height` | 500 | Hauteur zone exploration (cm) |
+| `exploration_altitude` | 100 | Altitude de vol (cm) |
+| `step_size` | 50 | Précision grille (cm) |
+| `pattern` | "snake" | Pattern: snake, spiral, room_search |
+| `scan_interval` | 300 | Distance entre scans 360° (cm) |
+| `safety_margin` | 80 | Marge sécurité obstacles (cm) |
+| `min_battery` | 15 | Batterie minimum (%) |
+| `max_duration` | 600 | Durée maximum mission (s) |
+
+### Zones de Sécurité
+
+```python
+from obstacle_avoidance import SafetyZone
+
+zone = SafetyZone(
+    front=100,      # Distance sécurité avant (cm)
+    back=60,        # Distance sécurité arrière (cm)
+    left=80,        # Distance sécurité gauche (cm)
+    right=80,       # Distance sécurité droite (cm)
+    above=50,       # Distance sécurité haut (cm)
+    below=40        # Distance sécurité bas (cm)
+)
+```
+
+## 📊 Cartographie
+
+Le système génère deux cartes simultanément :
+
+### Carte d'Altitude
+- Grille avec altitude estimée du sol
+- Détection de trous et dénivelés
+- Résolution configurable
+
+### Carte Thermique
+- Températures par cellule (20-200°C)
+- Identification zones chaudes
+- Détection foyers d'incendie
+
+### Export des Données
+
+```python
+# Export JSON + NumPy
+mission.export_results("output_folder")
+
+# Fichiers générés :
+# - output_folder_map.json      : Données structurées
+# - output_folder_altitude.npy  : Grille altitude
+# - output_folder_thermal.npy   : Grille thermique
+# - output_folder_occupancy.npy : Grille occupation
+```
+
+## 🛡️ Système de Sécurité
+
+### 3 Niveaux de Protection
+
+1. **Réflexes** (<100ms)
+   - Arrêt immédiat si obstacle <40cm
+   - Montée automatique si altitude <25cm
+   - Évitement latéral si obstacle <30cm
+
+2. **Évitement Planifié**
+   - Analyse trajectoire avant mouvement
+   - Calcul chemin de contournement
+   - 9 stratégies adaptatives
+
+3. **Scans Périodiques**
+   - Rotation 360° tous les X mètres
+   - Vérification 6 directions
+   - Mise à jour carte obstacles
+
+### Stratégies d'Évitement
+
+| Stratégie | Condition |
+|-----------|-----------|
+| STOP | Obstacle proche, évaluation nécessaire |
+| GO_LEFT/RIGHT | Obstacle frontal, côté libre |
+| GO_UP/DOWN | Obstacle horizontal, vertical libre |
+| BACKTRACK | Impasse, retour arrière |
+| GO_AROUND | Contournement planifié |
+| EMERGENCY_LAND | Danger critique |
+
+## 🔥 Détection Thermique
+
+### Classification des Zones
+
+| Type | Température | Action |
+|------|-------------|--------|
+| cold | <20°C | Normal |
+| normal | 20-50°C | Normal |
+| warm | 50-80°C | Attention |
+| hot | 80-150°C | ⚠️ Alerte |
+| fire | >150°C | 🔥 Danger |
+
+### Callbacks d'Alertes
+
+```python
+def on_thermal_alert(position, temperature, hotspots):
+    print(f"⚠️ Zone chaude détectée: {temperature}°C à {position}")
+    for hs in hotspots:
+        print(f"  - {hs['type']}: {hs['temperature']}°C")
+
+mission.on_thermal_alert = on_thermal_alert
+```
+
+## 📈 Rapport de Mission
+
+```python
+report = mission.get_mission_report()
+```
+
+Contenu du rapport :
+- **Progression** : Waypoints complétés, pourcentage
+- **Couverture** : Pourcentage zone cartographiée
+- **Obstacles** : Nombre détecté, types, mobiles
+- **Thermique** : Température max, zones chaudes, feu détecté
+- **Sécurité** : Collisions évitées, temps réaction
+- **Télémétrie** : Batterie, durée, position finale
+
+## 🧪 Tests
+
+### Tests Unitaires
+
+```bash
+# Test contrôleur
+python tello_controller.py
+
+# Test vision
+python vision.py
+
+# Test cartographie
+python mapping.py
+
+# Test évitement
+python obstacle_avoidance.py
+
+# Test exploration complète
+python exploration.py
+```
+
+### Notebook Jupyter
+
+```bash
+jupyter notebook demo_exploration_complete.ipynb
+```
+
+## 📚 Architecture Technique
+
+### Flux de Données
+
+```
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Tello     │────▶│   Vision     │────▶│  Mapping    │
+│  Controller │     │  Processing  │     │   (Dual)    │
+└─────────────┘     └──────────────┘     └─────────────┘
+       │                   │                    │
+       │                   ▼                    │
+       │           ┌──────────────┐             │
+       └──────────▶│  Obstacle    │◀────────────┘
+                   │  Avoidance   │
+                   └──────────────┘
+                          │
+                          ▼
+                   ┌──────────────┐
+                   │ Exploration  │
+                   │   Mission    │
+                   └──────────────┘
+```
+
+### Threads et Timing
+
+| Composant | Fréquence | Description |
+|-----------|-----------|-------------|
+| Video Stream | 30 Hz | Capture frames |
+| Obstacle Monitor | 50 Hz | Surveillance continue |
+| Reactive Avoidance | <100ms | Réflexes |
+| Safety Scanner | Configurable | Scans 360° |
+
+## ⚠️ Limitations
+
+- **Caméra thermique** : Simulée via analyse colorimétrique (sans capteur IR réel)
+- **SLAM** : Odométrie simple (pas de visual SLAM complet)
+- **Indoor** : Conçu pour espaces intérieurs
+- **Tello EDU** : Spécifique à ce modèle de drone
+
+## 🔧 Extension
+
+### Ajout de Capteurs
+
+```python
+# Exemple : intégration capteur externe
+class CustomSensor:
+    def read(self):
+        return sensor_value
+
+# Dans exploration.py
+self.custom_sensor = CustomSensor()
+```
+
+### Nouveaux Patterns d'Exploration
+
+```python
+# Dans mapping.py, classe ExplorationPlanner
+def custom_pattern(self):
+    waypoints = []
+    # Logique personnalisée
+    return waypoints
+```
 
 ## 📄 Licence
 
-Ce projet est fourni à des fins éducatives et de recherche.
+MIT License - Voir fichier [LICENSE](LICENSE)
 
-## 👤 Auteur
+## 👥 Contribution
 
-Généré par Claude (Anthropic) pour l'exploration de zones dangereuses avec drone Tello EDU.
+Les contributions sont bienvenues ! Merci de :
+1. Fork le projet
+2. Créer une branche feature (`git checkout -b feature/AmazingFeature`)
+3. Commit les changements (`git commit -m 'Add AmazingFeature'`)
+4. Push la branche (`git push origin feature/AmazingFeature`)
+5. Ouvrir une Pull Request
+
+## 📞 Support
+
+Pour toute question ou problème :
+- Ouvrir une Issue sur le dépôt
+- Consulter la documentation des modules (docstrings)
+
+---
+
+**⚡ Développé pour sauver des vies dans les environnements dangereux**

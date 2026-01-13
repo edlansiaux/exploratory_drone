@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Module d'exploration autonome pour drone Tello EDU
-Intègre contrôle, cartographie et évitement d'obstacles
-Conçu pour l'exploration de zones dangereuses (NRBC)
+Module d'exploration autonome optimisé pour Tello EDU
+Exploration de bâtiments délabrés avec cartographie thermique
 """
 
 import time
@@ -14,298 +13,302 @@ from enum import Enum
 from dataclasses import dataclass
 
 from tello_controller import TelloController, DroneState, Position
-from mapping import AltitudeMap, ExplorationPlanner, Obstacle
+from mapping import DualMap, ExplorationPlanner, Obstacle
 from obstacle_avoidance import (
-    ObstacleAvoidanceSystem, 
-    ReactiveAvoidance, 
+    ObstacleAvoidanceSystem,
+    ReactiveAvoidance,
     AvoidanceStrategy,
-    SafetyZone
+    SafetyZone,
+    ThreatLevel
 )
+from vision import VideoStream, ObstacleDetector, ThermalDetector, VisualObstacle
 
 logger = logging.getLogger(__name__)
-
-
-class ExplorationMode(Enum):
-    """Modes d'exploration disponibles"""
-    MANUAL = "manual"           # Contrôle manuel uniquement
-    SEMI_AUTO = "semi_auto"     # Navigation auto avec supervision
-    FULL_AUTO = "full_auto"     # Exploration complètement autonome
 
 
 class MissionStatus(Enum):
     """État de la mission"""
     IDLE = "idle"
     PREPARING = "preparing"
+    SCANNING = "scanning"
     IN_PROGRESS = "in_progress"
     PAUSED = "paused"
+    AVOIDING = "avoiding"
     RETURNING = "returning"
     COMPLETED = "completed"
     ABORTED = "aborted"
     EMERGENCY = "emergency"
 
 
+class ExplorationMode(Enum):
+    """Mode d'exploration"""
+    MANUAL = "manual"
+    SEMI_AUTO = "semi_auto"
+    FULL_AUTO = "full_auto"
+
+
 @dataclass
 class MissionConfig:
-    """Configuration d'une mission d'exploration"""
-    area_width: float = 500.0      # Largeur zone à explorer (cm)
-    area_height: float = 500.0     # Hauteur zone à explorer (cm)
-    exploration_altitude: float = 120.0  # Altitude d'exploration (cm)
-    step_size: float = 50.0        # Pas d'exploration (cm)
-    pattern: str = "snake"         # Pattern: "snake" ou "spiral"
-    max_duration: float = 600.0    # Durée max en secondes
-    min_battery: int = 20          # Batterie min avant retour
+    """Configuration de la mission"""
+    # Zone d'exploration
+    area_width: float = 500.0           # cm
+    area_height: float = 500.0          # cm
+    exploration_altitude: float = 100.0  # cm
+    step_size: float = 50.0             # cm
+    
+    # Pattern
+    pattern: str = "snake"  # snake, spiral, room_search
+    
+    # Limites
+    max_duration: float = 600.0         # secondes
+    min_battery: int = 15               # %
+    
+    # Sécurité
+    scan_interval: float = 300.0        # cm (scan 360° tous les 3m)
+    safety_margin: float = 80.0         # cm
+    
+    # Fonctionnalités
     enable_mapping: bool = True
+    enable_thermal: bool = True
     enable_avoidance: bool = True
+    enable_scanning: bool = True
 
 
-class HazardDetector:
+class SafetyScanner:
     """
-    Simulateur de détection de dangers NRBC
-    En situation réelle, serait connecté à des capteurs spécialisés
+    Scanner de sécurité 360°
+    Vérifie régulièrement toutes les directions
     """
     
-    def __init__(self):
-        self.thermal_threshold = 50.0  # °C
-        self.radiation_threshold = 0.5  # mSv/h
-        self.chemical_threshold = 100   # ppm
+    def __init__(self, controller: TelloController, detector: ObstacleDetector,
+                 thermal: ThermalDetector):
+        self.controller = controller
+        self.detector = detector
+        self.thermal = thermal
         
-        # Données simulées
-        self.simulated_hotspots = []
-        
-    def add_simulated_hotspot(self, x: float, y: float, z: float, 
-                              hazard_type: str, intensity: float):
-        """Ajoute un point chaud simulé"""
-        self.simulated_hotspots.append({
-            'x': x, 'y': y, 'z': z,
-            'type': hazard_type,
-            'intensity': intensity
-        })
-    
-    def check_hazards(self, x: float, y: float, z: float) -> dict:
-        """
-        Vérifie les dangers à une position donnée
-        
-        Returns:
-            Dictionnaire avec les niveaux de danger détectés
-        """
-        hazards = {
-            'thermal': 0.0,
-            'radiation': 0.0,
-            'chemical': 0.0,
-            'alerts': []
+        self.scan_results = {
+            'front': {'clear': True, 'distance': 500, 'obstacles': []},
+            'right': {'clear': True, 'distance': 500, 'obstacles': []},
+            'back': {'clear': True, 'distance': 500, 'obstacles': []},
+            'left': {'clear': True, 'distance': 500, 'obstacles': []},
+            'up': {'clear': True, 'distance': 500},
+            'down': {'clear': True, 'distance': 500},
         }
         
-        for hotspot in self.simulated_hotspots:
-            dist = ((x - hotspot['x'])**2 + 
-                   (y - hotspot['y'])**2 + 
-                   (z - hotspot['z'])**2) ** 0.5
+        self.thermal_readings = []
+        self.last_scan_time = 0
+        self.scan_in_progress = False
+    
+    def perform_360_scan(self, video_stream: VideoStream,
+                         on_progress: Callable = None) -> dict:
+        """
+        Effectue un scan 360° complet
+        
+        Returns:
+            Résultats du scan par direction
+        """
+        if self.scan_in_progress:
+            return self.scan_results
+        
+        self.scan_in_progress = True
+        logger.info("📡 DÉBUT SCAN 360°")
+        
+        directions = ['front', 'right', 'back', 'left']
+        
+        for i, direction in enumerate(directions):
+            if on_progress:
+                on_progress(i + 1, 4, direction)
             
-            if dist < 200:  # Zone d'effet de 2m
-                intensity = hotspot['intensity'] * (1 - dist/200)
+            # Attendre stabilisation
+            time.sleep(0.5)
+            
+            # Capturer et analyser
+            frame = video_stream.get_frame()
+            if frame is not None:
+                # Détection obstacles
+                obstacles = self.detector.detect(frame)
                 
-                if hotspot['type'] == 'thermal':
-                    hazards['thermal'] = max(hazards['thermal'], intensity)
-                elif hotspot['type'] == 'radiation':
-                    hazards['radiation'] = max(hazards['radiation'], intensity)
-                elif hotspot['type'] == 'chemical':
-                    hazards['chemical'] = max(hazards['chemical'], intensity)
+                # Détection thermique
+                _, hotspots = self.thermal.detect(frame)
+                
+                # Mise à jour résultats
+                self.scan_results[direction]['obstacles'] = obstacles
+                self.scan_results[direction]['clear'] = len([
+                    o for o in obstacles if o.distance_estimate < 100
+                ]) == 0
+                
+                if obstacles:
+                    self.scan_results[direction]['distance'] = min(
+                        o.distance_estimate for o in obstacles
+                    )
+                else:
+                    self.scan_results[direction]['distance'] = 500
+                
+                # Enregistrer lectures thermiques
+                for hotspot in hotspots:
+                    self.thermal_readings.append({
+                        'direction': direction,
+                        'temperature': hotspot.temperature,
+                        'timestamp': time.time()
+                    })
+            
+            # Rotation vers direction suivante (sauf dernière)
+            if i < 3:
+                self.controller.rotate_clockwise(90)
+                time.sleep(0.8)
         
-        # Générer les alertes
-        if hazards['thermal'] > self.thermal_threshold:
-            hazards['alerts'].append(f"ALERTE THERMIQUE: {hazards['thermal']:.1f}°C")
-        if hazards['radiation'] > self.radiation_threshold:
-            hazards['alerts'].append(f"ALERTE RADIATION: {hazards['radiation']:.2f} mSv/h")
-        if hazards['chemical'] > self.chemical_threshold:
-            hazards['alerts'].append(f"ALERTE CHIMIQUE: {hazards['chemical']:.0f} ppm")
+        # Retour position initiale
+        self.controller.rotate_clockwise(90)
+        time.sleep(0.5)
         
-        return hazards
+        self.last_scan_time = time.time()
+        self.scan_in_progress = False
+        
+        logger.info("✅ SCAN 360° TERMINÉ")
+        self._log_scan_results()
+        
+        return self.scan_results
+    
+    def _log_scan_results(self):
+        """Log les résultats du scan"""
+        for direction, data in self.scan_results.items():
+            if direction in ['up', 'down']:
+                continue
+            status = "✓" if data['clear'] else "⚠️"
+            logger.info(f"  {direction}: {status} dist={data['distance']:.0f}cm obs={len(data.get('obstacles', []))}")
+    
+    def quick_scan(self, video_stream: VideoStream) -> dict:
+        """Scan rapide frontal uniquement"""
+        frame = video_stream.get_frame()
+        if frame is None:
+            return self.scan_results
+        
+        obstacles = self.detector.detect(frame)
+        _, hotspots = self.thermal.detect(frame)
+        
+        self.scan_results['front']['obstacles'] = obstacles
+        self.scan_results['front']['clear'] = len([
+            o for o in obstacles if o.distance_estimate < 80
+        ]) == 0
+        
+        if obstacles:
+            self.scan_results['front']['distance'] = min(
+                o.distance_estimate for o in obstacles
+            )
+        
+        return self.scan_results
+    
+    def get_safest_direction(self) -> str:
+        """Retourne la direction la plus sûre"""
+        safest = 'front'
+        max_dist = 0
+        
+        for direction in ['front', 'right', 'back', 'left']:
+            dist = self.scan_results[direction]['distance']
+            if dist > max_dist and self.scan_results[direction]['clear']:
+                max_dist = dist
+                safest = direction
+        
+        return safest
 
 
 class ExplorationMission:
     """
-    Gestionnaire de mission d'exploration "Nez en avant"
-    Avec scan 360° initial et périodique (tous les 5m)
+    Gestionnaire de mission d'exploration pour bâtiments délabrés
+    Navigation sécurisée avec scans périodiques et cartographie thermique
     """
     
     def __init__(self, config: MissionConfig = None, simulation_mode: bool = False):
-        # ... (init existant) ...
         self.config = config or MissionConfig()
         self.simulation_mode = simulation_mode
         
-        # Composants (gardez votre initialisation existante)
+        # Composants principaux
         self.controller = TelloController(simulation_mode)
-        self.altitude_map = AltitudeMap(resolution=self.config.step_size, size=(self.config.area_width, self.config.area_height))
-        self.planner = ExplorationPlanner(self.altitude_map, step_size=self.config.step_size)
-        self.avoidance = ObstacleAvoidanceSystem(SafetyZone(front=80, back=50, left=50, right=50, above=50, below=40))
-        self.reactive = ReactiveAvoidance(emergency_distance=40)
-        self.hazard_detector = HazardDetector()
+        self.dual_map = DualMap(
+            resolution=self.config.step_size,
+            size=(self.config.area_width, self.config.area_height)
+        )
+        self.planner = ExplorationPlanner(self.dual_map, self.config.step_size)
+        
+        # Système d'évitement
+        self.avoidance = ObstacleAvoidanceSystem(SafetyZone(
+            front=self.config.safety_margin,
+            back=60, left=60, right=60, above=50, below=40,
+            emergency_front=40, emergency_sides=25, emergency_vertical=25
+        ))
+        self.reactive = ReactiveAvoidance(emergency_distance=35)
+        
+        # Vision
+        self.video_stream = VideoStream(simulation_mode=simulation_mode)
+        self.obstacle_detector = ObstacleDetector()
+        self.thermal_detector = ThermalDetector()
+        
+        # Scanner de sécurité
+        self.scanner = SafetyScanner(
+            self.controller, self.obstacle_detector, self.thermal_detector
+        )
         
         # État de la mission
         self.status = MissionStatus.IDLE
         self.mode = ExplorationMode.FULL_AUTO
-        self.distance_since_last_scan = 0.0
-        self.scan_threshold = 500.0  # Scan tous les 500 cm (5 mètres)
+        
+        # Compteurs
         self.start_time: Optional[float] = None
         self.waypoints_completed = 0
         self.total_waypoints = 0
+        self.distance_since_scan = 0.0
         
-        # Thread d'exploration
+        # Threads
         self._exploration_thread: Optional[threading.Thread] = None
-        self._stop_exploration = threading.Event()
-        self._pause_exploration = threading.Event()
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
         
         # Callbacks
         self.on_status_change: Optional[Callable] = None
-        self.on_hazard_detected: Optional[Callable] = None
         self.on_waypoint_reached: Optional[Callable] = None
         self.on_obstacle_detected: Optional[Callable] = None
+        self.on_thermal_alert: Optional[Callable] = None
+        self.on_scan_complete: Optional[Callable] = None
         
-        # Configuration des callbacks d'évitement
+        # Config callbacks internes
         self.avoidance.on_obstacle_detected = self._handle_obstacle_detected
+        self.avoidance.on_collision_imminent = self._handle_collision_imminent
         
-        logger.info(f"Mission initialisée (simulation: {simulation_mode})")
+        logger.info(f"ExplorationMission initialisée (simulation: {simulation_mode})")
     
-    def _perform_safety_scan(self):
-        """
-        Effectue une rotation pour scanner l'environnement (Avant/Arrière/Côtés)
-        Indispensable car la caméra est seulement frontale.
-        """
-        logger.info("📡 DÉBUT SCAN 360° DE SÉCURITÉ")
-        
-        # On fait 4 rotations de 90 degrés
-        # Cela permet au SLAM de se recaler et à la vision de détecter les obstacles
-        for i in range(4):
-            if self._stop_exploration.is_set():
-                break
-                
-            logger.info(f"Scan partie {i+1}/4...")
-            self.controller.rotate_clockwise(90)
-            
-            # Pause CRUCIALE pour stabiliser l'image (flou de mouvement = ennemi du SLAM)
-            time.sleep(1.0) 
-            
-            # Enregistrer les données (carte altitude + détection dangers)
-            self._record_exploration_data()
-            
-        self.distance_since_last_scan = 0.0
-        logger.info("✅ SCAN 360° TERMINÉ")
-
-    def _navigate_to_waypoint(self, waypoint: Tuple[float, float]) -> bool:
-        """
-        Navigation "Nez en avant" : Rotation puis Avancée
-        """
-        target_x, target_y = waypoint
-        target_z = self.config.exploration_altitude
-        
-        current = self.controller.position
-        
-        # 1. Calcul du vecteur vers la cible
-        dx = target_x - current.x
-        dy = target_y - current.y
-        distance = math.sqrt(dx**2 + dy**2)
-        
-        if distance < 10: # Déjà arrivé
-            return True
-
-        # 2. Vérification de sécurité (Scan) si on change radicalement de direction
-        # ou si c'est le début du mouvement
-        self._perform_safety_scan()
-
-        # 3. Calcul de l'angle cible (en degrés)
-        # atan2 retourne l'angle en radians par rapport à l'axe X
-        target_angle_rad = math.atan2(dy, dx)
-        target_angle_deg = math.degrees(target_angle_rad)
-        
-        # Conversion du repère mathématique au repère drone (si nécessaire)
-        # Supposons ici que 0° = Axe Y (Nord) pour le drone Tello
-        # L'ajustement dépend de votre repère initial dans mapping.py
-        
-        # 4. Rotation face à la cible
-        # Note: Il faut implémenter une logique pour calculer la différence d'angle 
-        # par rapport à l'orientation actuelle du drone.
-        # Pour simplifier ici, on utilise une rotation relative basée sur le vecteur
-        
-        logger.info(f"Orientation vers le waypoint ({target_x:.0f}, {target_y:.0f})")
-        # On pivote pour faire face au mouvement
-        # (Nécessite de connaître l'angle actuel du drone, voir modification tello_controller)
-        # Si on ne connait pas l'angle absolu, on ne peut pas utiliser cette méthode facilement.
-        # Alternative simple : on désactive le strafing.
-        
-        # Si nous sommes en mode "Nez en avant strict", on ne fait que avancer.
-        # Pour ce faire, il faut calculer l'angle de rotation requis.
-        
-        # ... (Logique de rotation ici via self.controller.rotate_...) ...
-        
-        # 5. Avancer vers la cible (par petits pas pour vérifier les obstacles)
-        step = 50 # cm
-        remaining = distance
-        
-        while remaining > 0:
-            if self._stop_exploration.is_set():
-                return False
-                
-            # Distance à parcourir pour ce pas
-            move_dist = min(remaining, step)
-            
-            # Vérification Obstacle Frontal (Vision)
-            # On utilise le détecteur d'obstacle via la caméra frontale
-            # C'est géré par l'événement on_obstacle_detected ou via self.avoidance
-            
-            # Si un obstacle est détecté devant via la vision ou le SLAM
-            # La méthode _handle_obstacle_avoidance sera appelée
-            
-            # Mouvement avant UNIQUEMENT (pas de gauche/droite/arrière)
-            logger.info(f"Avance de {move_dist:.0f}cm")
-            success = self.controller.move_forward(int(move_dist))
-            
-            if not success:
-                logger.warning("Blocage détecté, tentative de contournement")
-                # Ici lancer une logique d'évitement qui implique de tourner
-                return False
-                
-            remaining -= move_dist
-            time.sleep(0.5) # Stabilisation
-            
-        return True
-
-    def _move_to_position(self, target_x: float, target_y: float, target_z: float) -> bool:
-        """
-        Surcharge de la méthode originale pour interdire les mouvements latéraux/arrières
-        """
-        # Cette méthode est appelée par la logique d'évitement ou de navigation fine.
-        # On la redirige vers la logique de rotation + avance.
-        return self._navigate_to_waypoint((target_x, target_y))
-        
     def _set_status(self, new_status: MissionStatus):
-        """Change le statut et notifie"""
-        old_status = self.status
+        """Change le statut avec notification"""
+        old = self.status
         self.status = new_status
-        logger.info(f"Statut mission: {old_status.value} -> {new_status.value}")
+        logger.info(f"Status: {old.value} → {new_status.value}")
         
         if self.on_status_change:
-            self.on_status_change(old_status, new_status)
+            self.on_status_change(old, new_status)
     
     def _handle_obstacle_detected(self, obstacle):
-        """Callback quand un obstacle est détecté"""
-        # Ajouter à la carte
-        self.altitude_map.add_obstacle(
+        """Callback obstacle détecté"""
+        self.dual_map.add_obstacle(
             obstacle.x, obstacle.y, obstacle.z,
-            radius=50, is_mobile=obstacle.is_mobile
+            radius=50, is_mobile=obstacle.is_mobile,
+            obstacle_type=obstacle.obstacle_type
         )
         
         if self.on_obstacle_detected:
             self.on_obstacle_detected(obstacle)
     
-    def prepare_mission(self) -> bool:
-        """
-        Prépare la mission (connexion, checks pré-vol)
+    def _handle_collision_imminent(self, obstacle, threat_level):
+        """Callback collision imminente"""
+        logger.warning(f"⚠️ COLLISION IMMINENTE: {threat_level.value}")
         
-        Returns:
-            True si la préparation est réussie
-        """
+        if threat_level == ThreatLevel.CRITICAL:
+            # Réaction réflexe
+            self.controller.move_back(30)
+    
+    def prepare_mission(self) -> bool:
+        """Prépare la mission"""
         self._set_status(MissionStatus.PREPARING)
         
-        # Connexion au drone
+        # Connexion drone
         if not self.controller.connect():
             logger.error("Échec connexion drone")
             self._set_status(MissionStatus.ABORTED)
@@ -318,59 +321,66 @@ class ExplorationMission:
             self._set_status(MissionStatus.ABORTED)
             return False
         
-        # Génération du plan d'exploration
+        # Démarrage vidéo
+        if self.config.enable_mapping or self.config.enable_thermal:
+            self.video_stream.start()
+            time.sleep(1)
+        
+        # Génération du plan
         if self.config.pattern == "snake":
             waypoints = self.planner.generate_snake_pattern(
-                self.config.area_width,
-                self.config.area_height
+                self.config.area_width, self.config.area_height
+            )
+        elif self.config.pattern == "spiral":
+            waypoints = self.planner.generate_spiral_pattern(
+                max(self.config.area_width, self.config.area_height) / 2
             )
         else:
-            waypoints = self.planner.generate_spiral_pattern(
-                max_radius=max(self.config.area_width, self.config.area_height) / 2
+            waypoints = self.planner.generate_room_search_pattern(
+                self.config.area_width, self.config.area_height
             )
         
         self.total_waypoints = len(waypoints)
-        logger.info(f"Plan d'exploration: {self.total_waypoints} waypoints")
+        logger.info(f"Plan: {self.total_waypoints} waypoints ({self.config.pattern})")
         
         self._set_status(MissionStatus.IDLE)
         return True
     
     def start_exploration(self) -> bool:
-        """Démarre l'exploration avec un scan initial"""
-        """
-        Démarre l'exploration autonome
-        Returns:
-            True si le démarrage est réussi
-        """
+        """Démarre l'exploration"""
         if self.status not in [MissionStatus.IDLE, MissionStatus.PAUSED]:
-            logger.warning(f"Impossible de démarrer: statut = {self.status.value}")
+            logger.warning(f"Impossible de démarrer: {self.status.value}")
             return False
         
-        
-        
-        # Démarrer les systèmes
+        # Démarrage systèmes
         if self.config.enable_avoidance:
             self.avoidance.start_monitoring()
+        
         # Décollage si nécessaire
         if self.controller.state != DroneState.FLYING:
             if not self.controller.takeoff():
                 self._set_status(MissionStatus.ABORTED)
                 return False
             
-            # Monter à l'altitude d'exploration
-            current_alt = self.controller.position.z
-            if current_alt < self.config.exploration_altitude:
-                diff = int(self.config.exploration_altitude - current_alt)
-                if diff >= 20:
-                    self.controller.move_up(diff)
+            # Altitude d'exploration
+            alt_diff = self.config.exploration_altitude - self.controller.position.z
+            if alt_diff > 20:
+                self.controller.move_up(int(alt_diff))
         
-        # NOUVEAU : Scan initial obligatoire avant tout mouvement
-        logger.info("Exécution du scan initial avant exploration...")
-        self._perform_safety_scan()
+        # Scan initial 360°
+        if self.config.enable_scanning:
+            self._set_status(MissionStatus.SCANNING)
+            self.scanner.perform_360_scan(
+                self.video_stream,
+                on_progress=lambda c, t, d: logger.info(f"Scan {c}/{t}: {d}")
+            )
+            
+            if self.on_scan_complete:
+                self.on_scan_complete(self.scanner.scan_results)
         
-        # Démarrer le thread d'exploration
-        self._stop_exploration.clear()
-        self._pause_exploration.clear()
+        # Démarrage thread d'exploration
+        self._stop_event.clear()
+        self._pause_event.clear()
         self._exploration_thread = threading.Thread(
             target=self._exploration_loop,
             daemon=True
@@ -383,92 +393,106 @@ class ExplorationMission:
         return True
     
     def pause_exploration(self):
-        """Met en pause l'exploration"""
+        """Met en pause"""
         if self.status == MissionStatus.IN_PROGRESS:
-            self._pause_exploration.set()
+            self._pause_event.set()
             self._set_status(MissionStatus.PAUSED)
     
     def resume_exploration(self):
         """Reprend l'exploration"""
         if self.status == MissionStatus.PAUSED:
-            self._pause_exploration.clear()
+            self._pause_event.clear()
             self._set_status(MissionStatus.IN_PROGRESS)
     
     def stop_exploration(self):
-        """Arrête l'exploration et atterrit"""
-        self._stop_exploration.set()
+        """Arrête l'exploration"""
+        self._stop_event.set()
         
         if self._exploration_thread:
             self._exploration_thread.join(timeout=5.0)
         
         self.avoidance.stop_monitoring()
+        self.video_stream.stop()
         self.controller.land()
+        
         self._set_status(MissionStatus.COMPLETED)
     
     def emergency_stop(self):
-        """Arrêt d'urgence immédiat"""
-        self._stop_exploration.set()
+        """Arrêt d'urgence"""
+        self._stop_event.set()
         self.avoidance.stop_monitoring()
         self.controller.emergency_stop()
         self._set_status(MissionStatus.EMERGENCY)
     
     def return_to_home(self):
-        """Retourne au point de départ"""
+        """Retour à la base"""
         self._set_status(MissionStatus.RETURNING)
-        self._stop_exploration.set()
+        self._stop_event.set()
         
         if self._exploration_thread:
             self._exploration_thread.join(timeout=5.0)
         
         self.controller.return_to_home()
         self.controller.land()
+        
         self._set_status(MissionStatus.COMPLETED)
     
     def _exploration_loop(self):
-        """Boucle principale d'exploration autonome"""
-        logger.info("Démarrage de la boucle d'exploration")
+        """Boucle principale d'exploration"""
+        logger.info("Démarrage boucle d'exploration")
         
-        while not self._stop_exploration.is_set():
-            # Vérifier pause
-            if self._pause_exploration.is_set():
+        while not self._stop_event.is_set():
+            # Pause
+            if self._pause_event.is_set():
                 time.sleep(0.1)
                 continue
             
-            # Vérifier conditions de fin
-            if not self._check_mission_conditions():
+            # Vérifications
+            if not self._check_conditions():
                 break
             
-            # Obtenir le prochain waypoint
+            # Scan périodique
+            if self.config.enable_scanning:
+                if self.distance_since_scan >= self.config.scan_interval:
+                    self._set_status(MissionStatus.SCANNING)
+                    self.scanner.perform_360_scan(self.video_stream)
+                    self.distance_since_scan = 0
+                    
+                    if self.on_scan_complete:
+                        self.on_scan_complete(self.scanner.scan_results)
+                    
+                    self._set_status(MissionStatus.IN_PROGRESS)
+            
+            # Prochain waypoint
             waypoint = self.planner.get_next_waypoint()
             if waypoint is None:
                 logger.info("Exploration terminée - tous les waypoints atteints")
                 break
             
-            # Naviguer vers le waypoint
+            # Navigation
             success = self._navigate_to_waypoint(waypoint)
             
             if success:
                 self.waypoints_completed += 1
-                self._record_exploration_data()
+                self._record_data()
                 
                 if self.on_waypoint_reached:
                     self.on_waypoint_reached(waypoint, self.planner.get_progress())
             
-            # Petite pause pour stabilisation
-            time.sleep(0.2)
+            time.sleep(0.1)
         
         logger.info("Boucle d'exploration terminée")
     
-    def _check_mission_conditions(self) -> bool:
-        """Vérifie les conditions de continuation de la mission"""
-        # Vérifier la durée
+    def _check_conditions(self) -> bool:
+        """Vérifie les conditions de continuation"""
+        # Durée
         if self.start_time:
             elapsed = time.time() - self.start_time
             if elapsed > self.config.max_duration:
-                logger.warning("Durée maximale atteinte")
+                logger.warning("Durée max atteinte")
                 return False
         
-        # Vérifier la batterie
+        # Batterie
         telemetry = self.controller.get_telemetry()
         battery = telemetry.get('battery', 100)
         if battery < self.config.min_battery:
@@ -479,274 +503,261 @@ class ExplorationMission:
     
     def _navigate_to_waypoint(self, waypoint: Tuple[float, float]) -> bool:
         """
-        Navigation "Nez en avant" :
-        1. Calcule l'angle vers la cible
-        2. Pivote face à la cible
-        3. Avance en ligne droite (avec détection d'obstacles frontaux)
-        4. Gère les scans périodiques tous les 5m
+        Navigation vers un waypoint avec vérifications continues
         """
         target_x, target_y = waypoint
-        current_pos = self.controller.position
+        target_z = self.config.exploration_altitude
         
-        # 1. Calcul du vecteur de déplacement
-        dx = target_x - current_pos.x
-        dy = target_y - current_pos.y
+        current = self.controller.position
+        
+        # Calcul direction
+        dx = target_x - current.x
+        dy = target_y - current.y
         distance_total = math.sqrt(dx**2 + dy**2)
         
-        if distance_total < 10: return True # Déjà arrivé
+        if distance_total < 15:
+            return True
         
-        # 2. Calcul de l'angle cible (en degrés)
-        # Note: atan2(y, x) donne l'angle en radians
-        angle_rad = math.atan2(dy, dx)
-        angle_deg = math.degrees(angle_rad)
+        # Angle vers cible
+        target_angle = math.degrees(math.atan2(dy, dx))
         
-        # Conversion repère mathématique -> repère drone (si nécessaire, ici supposé aligné)
-        # Ajustement : Le Tello considère 0° comme l'axe avant au démarrage.
-        # Il faudrait idéalement convertir en coordonnées absolues si le mapping est absolu.
-        # Pour faire simple ici, on utilise une rotation relative approximative si on n'a pas de boussole fiable.
+        # Rotation vers cible
+        self.controller.rotate_to_angle(target_angle)
+        time.sleep(0.3)
         
-        logger.info(f"🧭 Orientation vers waypoint : {angle_deg:.0f}°")
-        
-        # Rotation face à la cible (si on a un capteur de cap, sinon on estime)
-        # Si on n'a pas de cap absolu fiable, on peut juste faire une rotation relative basée sur l'ancien waypoint
-        # Mais supposons que rotate_to_angle fonctionne (via IMU ou estimation)
-        self.controller.rotate_to_angle(angle_deg)
-        time.sleep(0.5) # Stabilisation post-rotation
-        
-        # 3. Avancer par petits pas pour scanner et vérifier les obstacles
-        step_size = 50.0 # cm par pas
-        distance_covered = 0.0
+        # Navigation par pas
+        step_size = self.config.step_size
+        distance_covered = 0
         
         while distance_covered < distance_total:
-            if self._stop_exploration.is_set(): return False
+            if self._stop_event.is_set():
+                return False
             
-            # Vérifier si on doit scanner (tous les 5m)
-            if self.distance_since_last_scan >= self.scan_threshold:
-                logger.info(f"📏 Distance 5m atteinte ({self.distance_since_last_scan:.0f}cm). Scan périodique.")
-                self._perform_safety_scan()
-                # Après le scan, il faut se réorienter vers la cible car le scan nous a fait tourner
-                self.controller.rotate_to_angle(angle_deg)
-                time.sleep(0.5)
-
-            # Calculer la distance du prochain pas
-            remaining = distance_total - distance_covered
-            current_step = min(step_size, remaining)
-        
-            # Vérifier les obstacles sur le chemin
+            # Scan rapide frontal
+            scan = self.scanner.quick_scan(self.video_stream)
+            
+            # Vérification réflexe
+            front_dist = scan['front']['distance']
+            reactive_action = self.reactive.check(
+                front_dist, self.controller.position.z
+            )
+            
+            if reactive_action:
+                return self._execute_reactive_action(reactive_action)
+            
+            # Vérification évitement
             if self.config.enable_avoidance:
-                collision, obstacle = self.avoidance.check_collision_risk(
-                    current_pos.x, current_pos.y, current_pos.z,
-                    target_x, target_y, target_z
+                current = self.controller.position
+                risk, obstacle, threat = self.avoidance.check_collision_risk(
+                    current.x, current.y, current.z,
+                    target_x, target_y, target_z,
+                    current.yaw
                 )
                 
-                if collision and obstacle:
-                    return self._handle_obstacle_avoidance(
-                        (current_pos.x, current_pos.y, current_pos.z),
+                if risk and threat.value >= ThreatLevel.HIGH.value:
+                    return self._handle_avoidance(
+                        (current.x, current.y, current.z),
                         (target_x, target_y, target_z),
-                        obstacle
+                        obstacle, threat
                     )
-        
-        # Mouvement AVANT uniquement
-            if self.controller.move_forward(int(current_step)):
-                distance_covered += current_step
-                self.distance_since_last_scan += current_step
+            
+            # Mouvement
+            remaining = distance_total - distance_covered
+            move_dist = min(step_size, remaining)
+            
+            if self.controller.move_forward(int(move_dist)):
+                distance_covered += move_dist
+                self.distance_since_scan += move_dist
                 
-                # Enregistrement des données (altitude sol)
-                self._record_exploration_data()
+                # Enregistrement données
+                self._record_data()
             else:
-                logger.warning("⛔ Blocage frontal détecté !")
-                # Ici : Logique de contournement (reculer, tourner, etc.)
+                logger.warning("Blocage détecté")
                 return False
-                
-        return True
-
-    # On désactive l'ancienne méthode de mouvement direct (x,y,z) car dangereuse sans caméras latérales
-    def _move_to_position(self, x, y, z):
-        return self._navigate_to_waypoint((x, y))
-    
-    def _handle_obstacle_avoidance(self, current: Tuple[float, float, float],
-                                    target: Tuple[float, float, float],
-                                    obstacle) -> bool:
-        """Gère l'évitement d'un obstacle détecté"""
-        logger.info(f"Évitement obstacle à ({obstacle.x:.0f}, {obstacle.y:.0f})")
+            
+            time.sleep(0.2)
         
-        # Déterminer la stratégie
+        return True
+    
+    def _execute_reactive_action(self, action: AvoidanceStrategy) -> bool:
+        """Exécute une action réflexe"""
+        logger.info(f"⚡ Action réflexe: {action.value}")
+        
+        if action == AvoidanceStrategy.BACKTRACK:
+            self.controller.move_back(50)
+        elif action == AvoidanceStrategy.GO_UP:
+            self.controller.move_up(50)
+        elif action == AvoidanceStrategy.GO_DOWN:
+            self.controller.move_down(30)
+        elif action == AvoidanceStrategy.GO_LEFT:
+            self.controller.move_left(50)
+        elif action == AvoidanceStrategy.GO_RIGHT:
+            self.controller.move_right(50)
+        
+        return False  # Réessayer le waypoint
+    
+    def _handle_avoidance(self, current: Tuple, target: Tuple,
+                         obstacle, threat: ThreatLevel) -> bool:
+        """Gère l'évitement d'obstacle"""
+        self._set_status(MissionStatus.AVOIDING)
+        
+        logger.info(f"Évitement obstacle: ({obstacle.x:.0f}, {obstacle.y:.0f})")
+        
+        # Stratégie
         strategy = self.avoidance.get_avoidance_strategy(current, target, obstacle)
         
         if strategy == AvoidanceStrategy.STOP:
-            # Attendre que l'obstacle mobile passe
             logger.info("Attente passage obstacle mobile...")
             time.sleep(2.0)
-            return False  # Réessayer au prochain cycle
+            self._set_status(MissionStatus.IN_PROGRESS)
+            return False
         
-        elif strategy == AvoidanceStrategy.EMERGENCY_LAND:
+        if strategy == AvoidanceStrategy.EMERGENCY_LAND:
             self.emergency_stop()
             return False
         
-        else:
-            # Calculer le chemin d'évitement
-            waypoints = self.avoidance.calculate_avoidance_waypoints(
-                current, target, obstacle, strategy
-            )
+        # Chemin d'évitement
+        path = self.avoidance.calculate_avoidance_path(current, target, obstacle, strategy)
+        
+        for wp in path:
+            if self._stop_event.is_set():
+                return False
             
-            # Suivre les waypoints d'évitement
-            for wp in waypoints:
-                if self._stop_exploration.is_set():
-                    return False
-                
-                if not self._move_to_position(*wp):
-                    return False
-            
-            return True
+            # Navigation simplifiée vers waypoint d'évitement
+            self._navigate_simple(wp)
+        
+        self._set_status(MissionStatus.IN_PROGRESS)
+        return True
     
-    def _move_to_position(self, target_x: float, target_y: float, 
-                          target_z: float) -> bool:
-        """
-        Déplace le drone vers une position cible
-        
-        Args:
-            target_x, target_y, target_z: Position cible
-        
-        Returns:
-            True si la position est atteinte
-        """
+    def _navigate_simple(self, target: Tuple[float, float, float]):
+        """Navigation simplifiée (sans vérification complète)"""
         current = self.controller.position
         
-        # Calculer les différences
-        dx = target_x - current.x
-        dy = target_y - current.y
-        dz = target_z - current.z
+        dx = target[0] - current.x
+        dy = target[1] - current.y
+        dz = target[2] - current.z
         
-        # Mouvement par étapes pour permettre les vérifications
-        try:
-            # Ajustement altitude d'abord (plus sûr)
-            if abs(dz) >= 20:
-                if dz > 0:
-                    self.controller.move_up(min(int(dz), 100))
-                else:
-                    self.controller.move_down(min(int(abs(dz)), 100))
-            
-            # Mouvement horizontal
-            if abs(dx) >= 20:
-                if dx > 0:
-                    self.controller.move_forward(min(int(dx), 100))
-                else:
-                    self.controller.move_back(min(int(abs(dx)), 100))
-            
-            if abs(dy) >= 20:
-                if dy > 0:
-                    self.controller.move_right(min(int(dy), 100))
-                else:
-                    self.controller.move_left(min(int(abs(dy)), 100))
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Erreur navigation: {e}")
-            return False
+        # Altitude d'abord
+        if abs(dz) > 20:
+            if dz > 0:
+                self.controller.move_up(min(int(dz), 100))
+            else:
+                self.controller.move_down(min(int(abs(dz)), 100))
+        
+        # Rotation
+        angle = math.degrees(math.atan2(dy, dx))
+        self.controller.rotate_to_angle(angle)
+        
+        # Avance
+        dist = math.sqrt(dx**2 + dy**2)
+        if dist > 20:
+            self.controller.move_forward(min(int(dist), 100))
     
-    def _record_exploration_data(self):
-        """Enregistre les données d'exploration au point actuel"""
+    def _record_data(self):
+        """Enregistre les données d'exploration"""
         if not self.config.enable_mapping:
             return
         
         pos = self.controller.position
         telemetry = self.controller.get_telemetry()
         
-        # Distance au sol (ToF ou estimation)
-        tof_distance = telemetry.get('tof_distance', pos.z)
+        # Distance au sol
+        tof = telemetry.get('tof_distance', pos.z)
         
-        # Ajouter le point à la carte
-        self.altitude_map.add_point(pos.x, pos.y, pos.z, tof_distance)
+        # Température
+        temp = 25.0
+        if self.config.enable_thermal:
+            frame = self.video_stream.get_frame()
+            if frame is not None:
+                _, hotspots = self.thermal_detector.detect(frame)
+                if hotspots:
+                    temp = max(h.temperature for h in hotspots)
+                    
+                    # Alerte si température élevée
+                    if temp > 80 and self.on_thermal_alert:
+                        self.on_thermal_alert(pos, temp, hotspots)
+                    
+                    # Zone thermique
+                    if temp > 60:
+                        self.dual_map.add_thermal_zone(
+                            pos.x, pos.y, pos.z, 50, temp,
+                            is_active=(temp > 100)
+                        )
         
-        # Vérifier les dangers
-        hazards = self.hazard_detector.check_hazards(pos.x, pos.y, pos.z)
-        if hazards['alerts']:
-            for alert in hazards['alerts']:
-                logger.warning(alert)
-            
-            if self.on_hazard_detected:
-                self.on_hazard_detected(pos, hazards)
+        # Enregistrement
+        self.dual_map.add_point(pos.x, pos.y, pos.z, tof, temp)
     
     def add_simulated_obstacle(self, x: float, y: float, z: float,
-                                is_mobile: bool = False,
-                                velocity: Tuple[float, float, float] = (0, 0, 0)):
-        """
-        Ajoute un obstacle simulé pour les tests
+                               is_mobile: bool = False,
+                               velocity: Tuple = (0, 0, 0),
+                               obstacle_type: str = "debris"):
+        """Ajoute un obstacle simulé"""
+        distance = math.sqrt(x**2 + y**2 + z**2)
+        direction = (x/max(distance,1), y/max(distance,1), z/max(distance,1))
         
-        Args:
-            x, y, z: Position de l'obstacle
-            is_mobile: Si True, l'obstacle est mobile
-            velocity: Vélocité si mobile
-        """
-        from obstacle_avoidance import DetectedObstacle
-        
-        obstacle = self.avoidance.add_obstacle(
-            x, y, z,
-            distance=((x**2 + y**2 + z**2) ** 0.5),
-            direction=(x, y, z)
-        )
+        obs = self.avoidance.add_obstacle(x, y, z, distance, direction, obstacle_type)
         
         if is_mobile:
-            # Simuler plusieurs mises à jour pour le marquer comme mobile
             for i in range(5):
                 time.sleep(0.1)
-                obstacle.update_position(
+                obs.update_position(
                     x + velocity[0] * i * 0.1,
                     y + velocity[1] * i * 0.1,
                     z + velocity[2] * i * 0.1,
-                    obstacle.distance
+                    distance
                 )
+        
+        return obs
     
     def get_mission_report(self) -> dict:
-        """Génère un rapport complet de la mission"""
+        """Génère le rapport de mission"""
         elapsed = 0
         if self.start_time:
             elapsed = time.time() - self.start_time
         
         telemetry = self.controller.get_telemetry()
+        map_stats = self.dual_map.get_statistics()
+        avoid_stats = self.avoidance.get_status_report()
         
         return {
             'status': self.status.value,
             'mode': self.mode.value,
             'duration_seconds': elapsed,
+            'simulation': self.simulation_mode,
             'waypoints': {
                 'completed': self.waypoints_completed,
                 'total': self.total_waypoints,
                 'progress': self.planner.get_progress()
             },
-            'mapping': {
-                'coverage': self.altitude_map.get_exploration_coverage(),
-                'points_recorded': len(self.altitude_map.raw_points),
-                'altitude_stats': self.altitude_map.get_altitude_stats()
+            'mapping': map_stats,
+            'avoidance': avoid_stats,
+            'thermal': {
+                'max_temperature': self.thermal_detector.get_max_temperature(),
+                'fire_detected': self.thermal_detector.has_fire_detected(),
+                'zones': len(self.dual_map.thermal_zones)
             },
-            'obstacles': self.avoidance.get_status_report(),
             'drone': {
                 'position': self.controller.position.to_tuple(),
+                'yaw': self.controller.position.yaw,
                 'state': self.controller.state.value,
                 'battery': telemetry.get('battery', 'N/A')
             }
         }
     
-    def display_map(self):
-        """Affiche la carte d'exploration"""
+    def display_map(self, show_thermal: bool = False):
+        """Affiche la carte"""
         drone_pos = (self.controller.position.x, self.controller.position.y)
-        print(self.altitude_map.to_ascii_map(drone_pos))
+        print(self.dual_map.to_ascii_map(drone_pos, show_thermal))
     
     def export_results(self, base_path: str = "exploration_results"):
-        """
-        Exporte les résultats de la mission
-        
-        Args:
-            base_path: Chemin de base pour les fichiers
-        """
+        """Exporte les résultats"""
         import json
         
-        # Export de la carte
-        self.altitude_map.export_to_json(f"{base_path}_map.json")
-        self.altitude_map.export_to_csv(f"{base_path}_points.csv")
+        # Carte
+        self.dual_map.export_to_json(f"{base_path}_map.json")
+        self.dual_map.export_grids(base_path)
         
-        # Export du rapport
+        # Rapport
         report = self.get_mission_report()
         with open(f"{base_path}_report.json", 'w') as f:
             json.dump(report, f, indent=2, default=str)
@@ -754,139 +765,83 @@ class ExplorationMission:
         logger.info(f"Résultats exportés: {base_path}_*")
 
 
-# ============================================================
-# Commandes manuelles simplifiées
-# ============================================================
-
-class ManualController:
-    """Interface simplifiée pour le contrôle manuel"""
-    
-    def __init__(self, mission: ExplorationMission):
-        self.mission = mission
-        self.controller = mission.controller
-    
-    def takeoff(self):
-        """Décollage"""
-        return self.controller.takeoff()
-    
-    def land(self):
-        """Atterrissage"""
-        return self.controller.land()
-    
-    def left(self, distance: int = 50):
-        """Gauche de 50cm par défaut"""
-        return self.controller.move_left(distance)
-    
-    def right(self, distance: int = 50):
-        """Droite de 50cm par défaut"""
-        return self.controller.move_right(distance)
-    
-    def up(self, distance: int = 50):
-        """Monter de 50cm par défaut"""
-        return self.controller.move_up(distance)
-    
-    def down(self, distance: int = 50):
-        """Descendre de 50cm par défaut"""
-        return self.controller.move_down(distance)
-    
-    def forward(self, distance: int = 50):
-        """Avancer de 50cm par défaut"""
-        return self.controller.move_forward(distance)
-    
-    def back(self, distance: int = 50):
-        """Reculer de 50cm par défaut"""
-        return self.controller.move_back(distance)
-    
-    def rotate_left(self, angle: int = 90):
-        """Rotation anti-horaire"""
-        return self.controller.rotate_counter_clockwise(angle)
-    
-    def rotate_right(self, angle: int = 90):
-        """Rotation horaire"""
-        return self.controller.rotate_clockwise(angle)
-    
-    def emergency(self):
-        """Arrêt d'urgence"""
-        self.controller.emergency_stop()
-    
-    def status(self):
-        """Affiche le statut"""
-        print(f"État: {self.controller.state.value}")
-        print(f"Position: {self.controller.position.to_tuple()}")
-        print(f"Télémétrie: {self.controller.get_telemetry()}")
-
-
-# Test du module
+# Test
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
     print("=" * 60)
-    print("TEST DU SYSTÈME D'EXPLORATION TELLO EDU")
+    print("TEST EXPLORATION MISSION")
     print("=" * 60)
     
-    # Configuration de test
+    # Configuration
     config = MissionConfig(
         area_width=300,
         area_height=300,
         exploration_altitude=100,
         step_size=50,
         pattern="snake",
-        max_duration=120
+        max_duration=60,
+        scan_interval=200
     )
     
-    # Création de la mission en mode simulation
+    # Mission
     mission = ExplorationMission(config, simulation_mode=True)
     
-    # Callbacks de test
+    # Callbacks
     def on_status(old, new):
-        print(f"[STATUS] {old.value} -> {new.value}")
+        print(f"[STATUS] {old.value} → {new.value}")
     
     def on_waypoint(wp, progress):
-        print(f"[WAYPOINT] {wp} - Progression: {progress:.1f}%")
+        print(f"[WAYPOINT] ({wp[0]:.0f}, {wp[1]:.0f}) - {progress:.1f}%")
     
-    def on_hazard(pos, hazards):
-        print(f"[HAZARD] Position: {pos.to_tuple()}")
-        for alert in hazards['alerts']:
-            print(f"  - {alert}")
+    def on_thermal(pos, temp, hotspots):
+        print(f"[THERMAL] ⚠️ {temp:.0f}°C à ({pos.x:.0f}, {pos.y:.0f})")
     
     mission.on_status_change = on_status
     mission.on_waypoint_reached = on_waypoint
-    mission.on_hazard_detected = on_hazard
+    mission.on_thermal_alert = on_thermal
     
     # Préparation
-    print("\n--- Préparation de la mission ---")
+    print("\n--- Préparation ---")
     if mission.prepare_mission():
         
-        # Ajout de dangers simulés
-        mission.hazard_detector.add_simulated_hotspot(100, 100, 0, 'thermal', 80)
-        mission.hazard_detector.add_simulated_hotspot(-50, 50, 0, 'radiation', 1.0)
-        
-        # Ajout d'obstacles simulés
-        mission.add_simulated_obstacle(75, 50, 100, is_mobile=False)
+        # Obstacles simulés
+        mission.add_simulated_obstacle(75, 50, 100, obstacle_type="debris")
         mission.add_simulated_obstacle(0, 100, 100, is_mobile=True, velocity=(10, 5, 0))
         
-        # Démarrage de l'exploration
-        print("\n--- Démarrage de l'exploration ---")
+        # Zone thermique
+        mission.dual_map.add_thermal_zone(100, 100, 50, 80, 120, True)
+        
+        # Démarrage
+        print("\n--- Démarrage ---")
         mission.start_exploration()
         
-        # Laisser l'exploration se dérouler
-        time.sleep(5)
+        # Exploration
+        time.sleep(8)
         
-        # Afficher la carte
-        print("\n--- Carte d'exploration ---")
-        mission.display_map()
+        # Cartes
+        print("\n--- Carte Altitude ---")
+        mission.display_map(show_thermal=False)
+        
+        print("\n--- Carte Thermique ---")
+        mission.display_map(show_thermal=True)
         
         # Arrêt
-        print("\n--- Arrêt de l'exploration ---")
+        print("\n--- Arrêt ---")
         mission.stop_exploration()
         
-        # Rapport final
-        print("\n--- Rapport de mission ---")
+        # Rapport
+        print("\n--- Rapport ---")
         report = mission.get_mission_report()
-        for key, value in report.items():
-            print(f"{key}: {value}")
+        for k, v in report.items():
+            print(f"  {k}: {v}")
         
-        # Export des résultats
+        # Export
         mission.export_results("/tmp/test_exploration")
-        
+    
     print("\n" + "=" * 60)
     print("TEST TERMINÉ")
     print("=" * 60)

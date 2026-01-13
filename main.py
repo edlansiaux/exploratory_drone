@@ -1,631 +1,364 @@
 #!/usr/bin/env python3
 """
-Interface utilisateur principale pour le système d'exploration Tello EDU
-Permet le contrôle manuel et automatique du drone
+Tello Explorer - Point d'entrée principal
+==========================================
+
+Lancement rapide d'une mission d'exploration.
+
+Usage:
+    python main.py --simulation              # Mode simulation
+    python main.py                           # Mode réel (drone connecté)
+    python main.py --help                    # Aide
+    python main.py --test                    # Test rapide des modules
+
+Exemples:
+    python main.py --simulation --width 400 --height 400 --pattern spiral
+    python main.py --simulation --duration 30 --altitude 120
 """
 
-import cmd
+import argparse
 import sys
 import time
-import threading
-from typing import Optional
 
-from exploration import (
-    ExplorationMission, 
-    MissionConfig, 
-    ManualController,
-    MissionStatus,
-    ExplorationMode
-)
+def test_modules():
+    """Test rapide de tous les modules."""
+    print("=" * 60)
+    print("🧪 TEST DES MODULES TELLO EXPLORER")
+    print("=" * 60)
+    
+    results = []
+    
+    # Test 1: Controller
+    print("\n📦 Test TelloController...")
+    try:
+        from tello_controller import TelloController
+        ctrl = TelloController(simulation_mode=True)
+        ctrl.connect()
+        ctrl.takeoff()
+        ctrl.move_forward(50)
+        ctrl.rotate_clockwise(90)
+        ctrl.land()
+        print("   ✅ TelloController OK")
+        results.append(("TelloController", True))
+    except Exception as e:
+        print(f"   ❌ TelloController ERREUR: {e}")
+        results.append(("TelloController", False))
+    
+    # Test 2: Vision
+    print("\n📦 Test Vision...")
+    try:
+        from vision import ObstacleDetector, ThermalDetector
+        import numpy as np
+        
+        detector = ObstacleDetector()
+        thermal = ThermalDetector()
+        
+        # Frame test
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        obstacles = detector.detect(frame)
+        hotspots = thermal.detect(frame)
+        
+        print(f"   Obstacles détectés: {len(obstacles)}")
+        print(f"   Hotspots détectés: {len(hotspots)}")
+        print("   ✅ Vision OK")
+        results.append(("Vision", True))
+    except Exception as e:
+        print(f"   ❌ Vision ERREUR: {e}")
+        results.append(("Vision", False))
+    
+    # Test 3: Mapping
+    print("\n📦 Test Mapping...")
+    try:
+        from mapping import DualMap, ExplorationPlanner
+        
+        dual_map = DualMap(resolution=50, size=(200, 200))
+        dual_map.add_point(50, 50, 100, ground_distance=100)
+        dual_map.add_obstacle(100, 100, 100, radius=30, obstacle_type="debris")
+        dual_map.add_thermal_zone(150, 150, 50, radius=30, temperature=120.0)
+        
+        planner = ExplorationPlanner(dual_map, step_size=50)
+        waypoints = planner.generate_snake_pattern(200, 200, 100)
+        
+        print(f"   Waypoints générés: {len(waypoints)}")
+        print(f"   Couverture: {dual_map.get_exploration_coverage():.1f}%")
+        print("   ✅ Mapping OK")
+        results.append(("Mapping", True))
+    except Exception as e:
+        print(f"   ❌ Mapping ERREUR: {e}")
+        results.append(("Mapping", False))
+    
+    # Test 4: Obstacle Avoidance
+    print("\n📦 Test Obstacle Avoidance...")
+    try:
+        from obstacle_avoidance import ObstacleAvoidanceSystem, SafetyZone, AvoidanceStrategy
+        
+        zone = SafetyZone(front=80, back=50, left=60, right=60)
+        avoidance = ObstacleAvoidanceSystem(safety_zone=zone)
+        
+        # Simuler obstacle avec direction
+        obs = avoidance.add_obstacle(50, 0, 100, distance=50, direction=(1, 0, 0), obstacle_type="wall")
+        
+        # Test stratégie avec arguments
+        strategy = avoidance.get_avoidance_strategy(
+            drone_pos=(0, 0, 100),
+            target_pos=(100, 0, 100),
+            obstacle=obs
+        )
+        
+        print(f"   Obstacle ajouté: {obs.obstacle_type}")
+        print(f"   Stratégie: {strategy.name}")
+        print("   ✅ Obstacle Avoidance OK")
+        results.append(("ObstacleAvoidance", True))
+    except Exception as e:
+        print(f"   ❌ Obstacle Avoidance ERREUR: {e}")
+        results.append(("ObstacleAvoidance", False))
+    
+    # Test 5: Exploration
+    print("\n📦 Test Exploration...")
+    try:
+        from exploration import ExplorationMission, MissionConfig
+        
+        config = MissionConfig(
+            area_width=200,
+            area_height=200,
+            step_size=50,
+            pattern="snake"
+        )
+        mission = ExplorationMission(config, simulation_mode=True)
+        mission.prepare_mission()
+        
+        print(f"   Waypoints: {mission.total_waypoints}")
+        print(f"   Pattern: {config.pattern}")
+        print("   ✅ Exploration OK")
+        results.append(("Exploration", True))
+    except Exception as e:
+        print(f"   ❌ Exploration ERREUR: {e}")
+        results.append(("Exploration", False))
+    
+    # Résumé
+    print("\n" + "=" * 60)
+    print("📊 RÉSUMÉ DES TESTS")
+    print("=" * 60)
+    
+    passed = sum(1 for _, ok in results if ok)
+    total = len(results)
+    
+    for name, ok in results:
+        status = "✅" if ok else "❌"
+        print(f"   {status} {name}")
+    
+    print(f"\n   Total: {passed}/{total} modules OK")
+    
+    if passed == total:
+        print("\n🎉 Tous les tests passés ! Le système est opérationnel.")
+        return 0
+    else:
+        print("\n⚠️  Certains tests ont échoué. Vérifiez les erreurs ci-dessus.")
+        return 1
 
 
-class TelloExplorerCLI(cmd.Cmd):
-    """Interface en ligne de commande pour l'exploration Tello"""
+def run_mission(args):
+    """Exécute une mission d'exploration."""
+    from exploration import ExplorationMission, MissionConfig
     
-    intro = """
-╔══════════════════════════════════════════════════════════════════╗
-║          SYSTÈME D'EXPLORATION TELLO EDU - v1.0                  ║
-║                                                                  ║
-║  Conçu pour l'exploration de zones à risque NRBC                 ║
-║  (Thermique/Nucléaire/Radiologique/Biologique/Chimique)          ║
-╚══════════════════════════════════════════════════════════════════╝
-
-Tapez 'help' ou '?' pour la liste des commandes.
-Tapez 'quickstart' pour un guide rapide.
-"""
-    prompt = "tello> "
+    print("=" * 60)
+    print("🚁 TELLO EXPLORER - MISSION D'EXPLORATION")
+    print("=" * 60)
     
-    def __init__(self, simulation_mode: bool = False):
-        super().__init__()
-        self.simulation_mode = simulation_mode
-        self.mission: Optional[ExplorationMission] = None
-        self.manual: Optional[ManualController] = None
-        self._live_display_thread: Optional[threading.Thread] = None
-        self._stop_live_display = threading.Event()
-        
-        # Configuration par défaut
-        self.config = MissionConfig()
-        
-        if simulation_mode:
-            print("\n⚠️  MODE SIMULATION ACTIVÉ - Aucun drone réel nécessaire\n")
+    # Configuration
+    config = MissionConfig(
+        area_width=args.width,
+        area_height=args.height,
+        exploration_altitude=args.altitude,
+        step_size=args.step,
+        pattern=args.pattern,
+        scan_interval=args.scan_interval,
+        safety_margin=args.safety_margin,
+        min_battery=args.min_battery,
+        max_duration=args.max_duration
+    )
     
-    # ==================== Commandes d'aide ====================
+    print(f"\n📋 Configuration:")
+    print(f"   Zone: {args.width}x{args.height} cm")
+    print(f"   Altitude: {args.altitude} cm")
+    print(f"   Pattern: {args.pattern}")
+    print(f"   Mode: {'Simulation' if args.simulation else 'Réel'}")
+    print(f"   Durée max: {args.duration}s")
     
-    def do_quickstart(self, arg):
-        """Affiche un guide de démarrage rapide"""
-        print("""
-╔══════════════════════════════════════════════════════════════════╗
-║                      GUIDE DE DÉMARRAGE RAPIDE                   ║
-╚══════════════════════════════════════════════════════════════════╝
-
-1. INITIALISATION
-   > init                    # Initialise la mission
-   
-2. CONTRÔLE MANUEL
-   > takeoff                 # Décollage
-   > up / down              # Monter/descendre de 50cm
-   > left / right           # Gauche/droite de 50cm
-   > forward / back         # Avant/arrière de 50cm
-   > land                    # Atterrissage
-
-3. EXPLORATION AUTOMATIQUE
-   > config                  # Voir/modifier la configuration
-   > prepare                 # Préparer la mission
-   > start                   # Démarrer l'exploration auto
-   > pause / resume          # Pause/reprise
-   > stop                    # Arrêter et atterrir
-   
-4. VISUALISATION
-   > status                  # État du drone
-   > map                     # Afficher la carte
-   > report                  # Rapport de mission
-   
-5. SIMULATION D'OBSTACLES
-   > obstacle 100 50 100     # Ajouter obstacle fixe
-   > mobile 0 100 100 10 5 0 # Ajouter obstacle mobile
-
-6. URGENCE
-   > emergency               # ARRÊT D'URGENCE IMMÉDIAT
-   > home                    # Retour au point de départ
-""")
+    # Création mission
+    mission = ExplorationMission(config, simulation_mode=args.simulation)
     
-    # ==================== Commandes d'initialisation ====================
+    # Callbacks
+    def on_status(status):
+        print(f"   📡 Status: {status}")
     
-    def do_init(self, arg):
-        """Initialise le système avec la configuration actuelle"""
-        print("Initialisation du système...")
-        self.mission = ExplorationMission(self.config, self.simulation_mode)
-        self.manual = ManualController(self.mission)
-        
-        # Configuration des callbacks
-        self.mission.on_status_change = self._on_status_change
-        self.mission.on_waypoint_reached = self._on_waypoint
-        self.mission.on_hazard_detected = self._on_hazard
-        self.mission.on_obstacle_detected = self._on_obstacle
-        
-        print("✓ Système initialisé")
-        print(f"  Mode: {'Simulation' if self.simulation_mode else 'Réel'}")
-        print(f"  Zone: {self.config.area_width}x{self.config.area_height} cm")
+    def on_waypoint(wp, progress):
+        print(f"   📍 Waypoint {wp}: {progress:.1f}%")
     
-    def do_connect(self, arg):
-        """Connecte au drone"""
-        if not self._check_init():
-            return
-        
-        print("Connexion au drone...")
-        if self.mission.controller.connect():
-            print("✓ Connecté au drone")
-            telemetry = self.mission.controller.get_telemetry()
-            print(f"  Batterie: {telemetry.get('battery', 'N/A')}%")
-        else:
-            print("✗ Échec de la connexion")
+    def on_obstacle(obs):
+        print(f"   ⚠️  Obstacle: {obs.get('type', 'unknown')} à {obs.get('distance', '?')}cm")
     
-    def do_disconnect(self, arg):
-        """Déconnecte du drone"""
-        if not self._check_init():
-            return
-        self.mission.controller.disconnect()
-        print("✓ Déconnecté")
+    def on_thermal(pos, temp, hotspots):
+        print(f"   🔥 Alerte thermique: {temp:.1f}°C à position {pos}")
     
-    # ==================== Commandes de configuration ====================
+    mission.on_status_change = on_status
+    mission.on_waypoint_reached = on_waypoint
+    mission.on_obstacle_detected = on_obstacle
+    mission.on_thermal_alert = on_thermal
     
-    def do_config(self, arg):
-        """
-        Affiche ou modifie la configuration
-        Usage: config [paramètre] [valeur]
-        Paramètres: width, height, altitude, step, pattern, duration, battery
-        """
-        args = arg.split()
-        
-        if not args:
-            # Afficher la configuration actuelle
-            print("\n=== Configuration actuelle ===")
-            print(f"  area_width:    {self.config.area_width} cm")
-            print(f"  area_height:   {self.config.area_height} cm")
-            print(f"  altitude:      {self.config.exploration_altitude} cm")
-            print(f"  step_size:     {self.config.step_size} cm")
-            print(f"  pattern:       {self.config.pattern}")
-            print(f"  max_duration:  {self.config.max_duration} s")
-            print(f"  min_battery:   {self.config.min_battery}%")
-            print(f"  mapping:       {self.config.enable_mapping}")
-            print(f"  avoidance:     {self.config.enable_avoidance}")
-            return
-        
-        if len(args) < 2:
-            print("Usage: config <paramètre> <valeur>")
-            return
-        
-        param, value = args[0], args[1]
-        
-        try:
-            if param == "width":
-                self.config.area_width = float(value)
-            elif param == "height":
-                self.config.area_height = float(value)
-            elif param == "altitude":
-                self.config.exploration_altitude = float(value)
-            elif param == "step":
-                self.config.step_size = float(value)
-            elif param == "pattern":
-                if value in ["snake", "spiral"]:
-                    self.config.pattern = value
-                else:
-                    print("Pattern invalide (snake ou spiral)")
-                    return
-            elif param == "duration":
-                self.config.max_duration = float(value)
-            elif param == "battery":
-                self.config.min_battery = int(value)
-            else:
-                print(f"Paramètre inconnu: {param}")
-                return
+    # Préparation
+    print(f"\n🔧 Préparation de la mission...")
+    if not mission.prepare_mission():
+        print("❌ Échec de la préparation")
+        return 1
+    
+    print(f"   Waypoints planifiés: {len(mission.waypoints)}")
+    
+    # Ajout obstacles simulés (mode simulation uniquement)
+    if args.simulation:
+        print("\n🏗️  Ajout environnement simulé...")
+        mission.add_simulated_obstacle(100, 50, 100, obstacle_type="debris")
+        mission.add_simulated_obstacle(0, 150, 100, obstacle_type="wall")
+        mission.dual_map.add_thermal_zone(120, 80, 50, radius=40, temperature=150.0)
+        mission.dual_map.add_thermal_zone(50, 180, 50, radius=30, temperature=85.0)
+        print("   ✅ Environnement configuré")
+    
+    # Lancement
+    print(f"\n🚀 Démarrage exploration ({args.duration}s)...")
+    mission.start_exploration()
+    
+    # Attente avec affichage progression
+    start_time = time.time()
+    try:
+        while time.time() - start_time < args.duration:
+            elapsed = time.time() - start_time
+            remaining = args.duration - elapsed
             
-            print(f"✓ {param} = {value}")
+            # Affichage périodique
+            if int(elapsed) % 5 == 0 and elapsed > 0:
+                report = mission.get_mission_report()
+                coverage = report.get('map_coverage', 0)
+                battery = report.get('battery', 100)
+                print(f"\n   ⏱️  {int(elapsed)}s | Couverture: {coverage:.1f}% | Batterie: {battery}%")
             
-        except ValueError:
-            print("Valeur invalide")
-    
-    # ==================== Commandes de vol manuel ====================
-    
-    def do_takeoff(self, arg):
-        """Fait décoller le drone"""
-        if not self._check_init():
-            return
-        
-        print("Décollage...")
-        if self.manual.takeoff():
-            print("✓ En vol")
-        else:
-            print("✗ Échec du décollage")
-    
-    def do_land(self, arg):
-        """Fait atterrir le drone"""
-        if not self._check_init():
-            return
-        
-        print("Atterrissage...")
-        if self.manual.land():
-            print("✓ Au sol")
-        else:
-            print("✗ Échec de l'atterrissage")
-    
-    def do_up(self, arg):
-        """Monte le drone (défaut: 50cm). Usage: up [distance]"""
-        if not self._check_init():
-            return
-        
-        distance = int(arg) if arg else 50
-        print(f"Montée de {distance}cm...")
-        self.manual.up(distance)
-    
-    def do_down(self, arg):
-        """Descend le drone (défaut: 50cm). Usage: down [distance]"""
-        if not self._check_init():
-            return
-        
-        distance = int(arg) if arg else 50
-        print(f"Descente de {distance}cm...")
-        self.manual.down(distance)
-    
-    def do_left(self, arg):
-        """Déplace le drone à gauche (défaut: 50cm). Usage: left [distance]"""
-        if not self._check_init():
-            return
-        
-        distance = int(arg) if arg else 50
-        print(f"Gauche de {distance}cm...")
-        self.manual.left(distance)
-    
-    def do_right(self, arg):
-        """Déplace le drone à droite (défaut: 50cm). Usage: right [distance]"""
-        if not self._check_init():
-            return
-        
-        distance = int(arg) if arg else 50
-        print(f"Droite de {distance}cm...")
-        self.manual.right(distance)
-    
-    def do_forward(self, arg):
-        """Avance le drone (défaut: 50cm). Usage: forward [distance]"""
-        if not self._check_init():
-            return
-        
-        distance = int(arg) if arg else 50
-        print(f"Avant de {distance}cm...")
-        self.manual.forward(distance)
-    
-    def do_back(self, arg):
-        """Recule le drone (défaut: 50cm). Usage: back [distance]"""
-        if not self._check_init():
-            return
-        
-        distance = int(arg) if arg else 50
-        print(f"Arrière de {distance}cm...")
-        self.manual.back(distance)
-    
-    def do_rotate(self, arg):
-        """
-        Fait pivoter le drone. Usage: rotate <left|right> [angle]
-        """
-        if not self._check_init():
-            return
-        
-        args = arg.split()
-        if not args:
-            print("Usage: rotate <left|right> [angle]")
-            return
-        
-        direction = args[0]
-        angle = int(args[1]) if len(args) > 1 else 90
-        
-        if direction == "left":
-            self.manual.rotate_left(angle)
-        elif direction == "right":
-            self.manual.rotate_right(angle)
-        else:
-            print("Direction: left ou right")
-    
-    # ==================== Commandes d'exploration auto ====================
-    
-    def do_prepare(self, arg):
-        """Prépare la mission d'exploration"""
-        if not self._check_init():
-            return
-        
-        print("Préparation de la mission...")
-        if self.mission.prepare_mission():
-            print("✓ Mission prête")
-            print(f"  Waypoints: {self.mission.total_waypoints}")
-        else:
-            print("✗ Échec de la préparation")
-    
-    def do_start(self, arg):
-        """Démarre l'exploration automatique"""
-        if not self._check_init():
-            return
-        
-        print("Démarrage de l'exploration...")
-        if self.mission.start_exploration():
-            print("✓ Exploration en cours")
-        else:
-            print("✗ Échec du démarrage")
-    
-    def do_pause(self, arg):
-        """Met en pause l'exploration"""
-        if not self._check_init():
-            return
-        
-        self.mission.pause_exploration()
-        print("⏸ Exploration en pause")
-    
-    def do_resume(self, arg):
-        """Reprend l'exploration"""
-        if not self._check_init():
-            return
-        
-        self.mission.resume_exploration()
-        print("▶ Exploration reprise")
-    
-    def do_stop(self, arg):
-        """Arrête l'exploration et atterrit"""
-        if not self._check_init():
-            return
-        
-        print("Arrêt de l'exploration...")
-        self.mission.stop_exploration()
-        print("✓ Exploration terminée")
-    
-    def do_home(self, arg):
-        """Retourne au point de départ"""
-        if not self._check_init():
-            return
-        
-        print("Retour à la base...")
-        self.mission.return_to_home()
-        print("✓ Retour effectué")
-    
-    def do_emergency(self, arg):
-        """ARRÊT D'URGENCE - Coupe immédiatement les moteurs"""
-        if not self._check_init():
-            return
-        
-        print("⚠️  ARRÊT D'URGENCE ⚠️")
-        self.mission.emergency_stop()
-    
-    # ==================== Commandes de visualisation ====================
-    
-    def do_status(self, arg):
-        """Affiche l'état actuel du drone"""
-        if not self._check_init():
-            return
-        
-        self.manual.status()
-        print(f"Mission: {self.mission.status.value}")
-        print(f"Progression: {self.mission.planner.get_progress():.1f}%")
-    
-    def do_map(self, arg):
-        """Affiche la carte d'exploration"""
-        if not self._check_init():
-            return
-        
-        self.mission.display_map()
-    
-    def do_report(self, arg):
-        """Affiche le rapport de mission complet"""
-        if not self._check_init():
-            return
-        
-        report = self.mission.get_mission_report()
-        
-        print("\n" + "=" * 50)
-        print("RAPPORT DE MISSION")
-        print("=" * 50)
-        
-        print(f"\nÉtat: {report['status']}")
-        print(f"Mode: {report['mode']}")
-        print(f"Durée: {report['duration_seconds']:.1f}s")
-        
-        print(f"\nProgression:")
-        print(f"  Waypoints: {report['waypoints']['completed']}/{report['waypoints']['total']}")
-        print(f"  Couverture: {report['waypoints']['progress']:.1f}%")
-        
-        print(f"\nCartographie:")
-        print(f"  Points enregistrés: {report['mapping']['points_recorded']}")
-        print(f"  Couverture carte: {report['mapping']['coverage']:.1f}%")
-        stats = report['mapping']['altitude_stats']
-        if stats['min'] is not None:
-            print(f"  Altitude sol: {stats['min']:.0f} - {stats['max']:.0f} cm")
-        
-        print(f"\nObstacles:")
-        print(f"  Total: {report['obstacles']['total_obstacles']}")
-        print(f"  Mobiles: {report['obstacles']['mobile_obstacles']}")
-        
-        print(f"\nDrone:")
-        print(f"  Position: {report['drone']['position']}")
-        print(f"  État: {report['drone']['state']}")
-        print(f"  Batterie: {report['drone']['battery']}%")
-        
-        print("=" * 50)
-    
-    def do_live(self, arg):
-        """Active/désactive l'affichage en direct. Usage: live [on|off]"""
-        if not self._check_init():
-            return
-        
-        if arg == "off":
-            self._stop_live_display.set()
-            print("Affichage live désactivé")
-        else:
-            if self._live_display_thread and self._live_display_thread.is_alive():
-                print("Affichage live déjà actif")
-                return
+            time.sleep(1)
             
-            self._stop_live_display.clear()
-            self._live_display_thread = threading.Thread(
-                target=self._live_display_loop,
-                daemon=True
-            )
-            self._live_display_thread.start()
-            print("Affichage live activé (Ctrl+C ou 'live off' pour arrêter)")
+    except KeyboardInterrupt:
+        print("\n\n⚡ Interruption utilisateur")
     
-    def _live_display_loop(self):
-        """Boucle d'affichage en direct"""
-        while not self._stop_live_display.is_set():
-            try:
-                pos = self.mission.controller.position
-                status = self.mission.status.value
-                progress = self.mission.planner.get_progress()
-                
-                print(f"\r[{status}] Pos: ({pos.x:.0f}, {pos.y:.0f}, {pos.z:.0f}) | "
-                      f"Progress: {progress:.1f}%", end="", flush=True)
-                
-                time.sleep(0.5)
-            except:
-                break
+    # Arrêt
+    print("\n🛑 Arrêt de la mission...")
+    mission.stop_exploration()
     
-    # ==================== Commandes de simulation ====================
+    # Rapport final
+    print("\n" + "=" * 60)
+    print("📊 RAPPORT DE MISSION")
+    print("=" * 60)
     
-    def do_obstacle(self, arg):
-        """
-        Ajoute un obstacle simulé fixe
-        Usage: obstacle <x> <y> <z>
-        """
-        if not self._check_init():
-            return
+    report = mission.get_mission_report()
+    
+    print(f"\n📈 Progression:")
+    print(f"   Waypoints: {report.get('waypoints_completed', 0)}/{report.get('waypoints_total', 0)}")
+    print(f"   Couverture: {report.get('map_coverage', 0):.1f}%")
+    
+    print(f"\n🚧 Obstacles:")
+    print(f"   Détectés: {report.get('obstacles_detected', 0)}")
+    print(f"   Collisions évitées: {report.get('collisions_avoided', 0)}")
+    
+    print(f"\n🌡️  Thermique:")
+    print(f"   Température max: {report.get('max_temperature', 20):.1f}°C")
+    print(f"   Zones chaudes: {report.get('thermal_zones', 0)}")
+    print(f"   Feu détecté: {'Oui 🔥' if report.get('fire_detected', False) else 'Non'}")
+    
+    print(f"\n🔋 Télémétrie:")
+    print(f"   Batterie: {report.get('battery', 100)}%")
+    print(f"   Durée: {report.get('duration', 0):.1f}s")
+    
+    # Affichage carte
+    if args.show_map:
+        print("\n📍 Carte d'exploration:")
+        mission.display_map(show_thermal=False)
         
-        args = arg.split()
-        if len(args) < 3:
-            print("Usage: obstacle <x> <y> <z>")
-            return
-        
-        try:
-            x, y, z = float(args[0]), float(args[1]), float(args[2])
-            self.mission.add_simulated_obstacle(x, y, z, is_mobile=False)
-            print(f"✓ Obstacle ajouté à ({x}, {y}, {z})")
-        except ValueError:
-            print("Valeurs invalides")
+        print("\n🌡️  Carte thermique:")
+        mission.display_map(show_thermal=True)
     
-    def do_mobile(self, arg):
-        """
-        Ajoute un obstacle mobile simulé
-        Usage: mobile <x> <y> <z> <vx> <vy> <vz>
-        """
-        if not self._check_init():
-            return
-        
-        args = arg.split()
-        if len(args) < 6:
-            print("Usage: mobile <x> <y> <z> <vx> <vy> <vz>")
-            return
-        
-        try:
-            x, y, z = float(args[0]), float(args[1]), float(args[2])
-            vx, vy, vz = float(args[3]), float(args[4]), float(args[5])
-            self.mission.add_simulated_obstacle(
-                x, y, z, 
-                is_mobile=True, 
-                velocity=(vx, vy, vz)
-            )
-            print(f"✓ Obstacle mobile ajouté à ({x}, {y}, {z}) vitesse ({vx}, {vy}, {vz})")
-        except ValueError:
-            print("Valeurs invalides")
+    # Export
+    if args.export:
+        print(f"\n💾 Export des données vers '{args.export}'...")
+        mission.export_results(args.export)
+        print("   ✅ Export terminé")
     
-    def do_hazard(self, arg):
-        """
-        Ajoute une zone de danger simulée
-        Usage: hazard <x> <y> <z> <type> <intensity>
-        Types: thermal, radiation, chemical
-        """
-        if not self._check_init():
-            return
-        
-        args = arg.split()
-        if len(args) < 5:
-            print("Usage: hazard <x> <y> <z> <type> <intensity>")
-            print("Types: thermal, radiation, chemical")
-            return
-        
-        try:
-            x, y, z = float(args[0]), float(args[1]), float(args[2])
-            hazard_type = args[3]
-            intensity = float(args[4])
-            
-            if hazard_type not in ['thermal', 'radiation', 'chemical']:
-                print("Type invalide")
-                return
-            
-            self.mission.hazard_detector.add_simulated_hotspot(
-                x, y, z, hazard_type, intensity
-            )
-            print(f"✓ Zone {hazard_type} ajoutée à ({x}, {y}, {z})")
-        except ValueError:
-            print("Valeurs invalides")
+    print("\n" + "=" * 60)
+    print("✅ MISSION TERMINÉE")
+    print("=" * 60)
     
-    # ==================== Commandes d'export ====================
-    
-    def do_export(self, arg):
-        """
-        Exporte les résultats de la mission
-        Usage: export [chemin_base]
-        """
-        if not self._check_init():
-            return
-        
-        base_path = arg if arg else "/tmp/tello_exploration"
-        self.mission.export_results(base_path)
-        print(f"✓ Résultats exportés vers {base_path}_*")
-    
-    # ==================== Commandes système ====================
-    
-    def do_quit(self, arg):
-        """Quitte le programme"""
-        print("Fermeture...")
-        
-        if self.mission:
-            if self.mission.status == MissionStatus.IN_PROGRESS:
-                self.mission.stop_exploration()
-            self.mission.controller.disconnect()
-        
-        print("Au revoir!")
-        return True
-    
-    do_exit = do_quit
-    do_q = do_quit
-    
-    def do_clear(self, arg):
-        """Efface l'écran"""
-        import os
-        os.system('clear' if os.name == 'posix' else 'cls')
-    
-    # ==================== Méthodes utilitaires ====================
-    
-    def _check_init(self) -> bool:
-        """Vérifie que le système est initialisé"""
-        if self.mission is None:
-            print("⚠️  Système non initialisé. Utilisez 'init' d'abord.")
-            return False
-        return True
-    
-    def _on_status_change(self, old, new):
-        """Callback changement de statut"""
-        print(f"\n[STATUS] {old.value} → {new.value}")
-    
-    def _on_waypoint(self, wp, progress):
-        """Callback waypoint atteint"""
-        print(f"\n[WAYPOINT] ({wp[0]:.0f}, {wp[1]:.0f}) - {progress:.1f}%")
-    
-    def _on_hazard(self, pos, hazards):
-        """Callback danger détecté"""
-        print(f"\n⚠️  [DANGER] Position: ({pos.x:.0f}, {pos.y:.0f}, {pos.z:.0f})")
-        for alert in hazards['alerts']:
-            print(f"    {alert}")
-    
-    def _on_obstacle(self, obstacle):
-        """Callback obstacle détecté"""
-        mobile_str = " (MOBILE)" if obstacle.is_mobile else ""
-        print(f"\n[OBSTACLE{mobile_str}] ({obstacle.x:.0f}, {obstacle.y:.0f}, {obstacle.z:.0f})")
-    
-    def emptyline(self):
-        """Ne rien faire sur ligne vide"""
-        pass
-    
-    def default(self, line):
-        """Commande inconnue"""
-        print(f"Commande inconnue: {line}")
-        print("Tapez 'help' pour la liste des commandes")
+    return 0
 
 
 def main():
-    """Point d'entrée principal"""
-    import argparse
-    
     parser = argparse.ArgumentParser(
-        description="Système d'exploration Tello EDU pour zones NRBC"
+        description="Tello Explorer - Système d'exploration autonome",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemples:
+  python main.py --simulation                    Mode simulation rapide
+  python main.py --simulation --duration 60      Simulation 60 secondes
+  python main.py --simulation --pattern spiral   Pattern spirale
+  python main.py --test                          Test des modules
+        """
     )
-    parser.add_argument(
-        '--simulation', '-s',
-        action='store_true',
-        help="Mode simulation (sans drone réel)"
-    )
-    parser.add_argument(
-        '--auto-init',
-        action='store_true',
-        help="Initialise automatiquement au démarrage"
-    )
+    
+    # Mode
+    parser.add_argument('--simulation', '-s', action='store_true',
+                        help='Mode simulation (sans drone)')
+    parser.add_argument('--test', '-t', action='store_true',
+                        help='Test rapide des modules')
+    
+    # Zone
+    parser.add_argument('--width', '-W', type=int, default=300,
+                        help='Largeur zone exploration en cm (défaut: 300)')
+    parser.add_argument('--height', '-H', type=int, default=300,
+                        help='Hauteur zone exploration en cm (défaut: 300)')
+    
+    # Navigation
+    parser.add_argument('--altitude', '-a', type=int, default=100,
+                        help='Altitude de vol en cm (défaut: 100)')
+    parser.add_argument('--step', type=int, default=50,
+                        help='Taille des pas en cm (défaut: 50)')
+    parser.add_argument('--pattern', '-p', choices=['snake', 'spiral', 'room_search'],
+                        default='snake', help='Pattern exploration (défaut: snake)')
+    
+    # Sécurité
+    parser.add_argument('--scan-interval', type=int, default=200,
+                        help='Intervalle scans 360° en cm (défaut: 200)')
+    parser.add_argument('--safety-margin', type=int, default=80,
+                        help='Marge sécurité en cm (défaut: 80)')
+    parser.add_argument('--min-battery', type=int, default=15,
+                        help='Batterie minimum en %% (défaut: 15)')
+    
+    # Durée
+    parser.add_argument('--duration', '-d', type=int, default=20,
+                        help='Durée mission en secondes (défaut: 20)')
+    parser.add_argument('--max-duration', type=int, default=600,
+                        help='Durée maximum en secondes (défaut: 600)')
+    
+    # Sortie
+    parser.add_argument('--show-map', '-m', action='store_true', default=True,
+                        help='Afficher les cartes (défaut: True)')
+    parser.add_argument('--no-map', action='store_false', dest='show_map',
+                        help='Ne pas afficher les cartes')
+    parser.add_argument('--export', '-e', type=str, default=None,
+                        help='Préfixe fichiers export (ex: mission_001)')
     
     args = parser.parse_args()
     
-    cli = TelloExplorerCLI(simulation_mode=args.simulation)
+    # Mode test
+    if args.test:
+        return test_modules()
     
-    if args.auto_init:
-        cli.do_init("")
-    
-    try:
-        cli.cmdloop()
-    except KeyboardInterrupt:
-        print("\n\nInterruption - Fermeture...")
-        cli.do_quit("")
+    # Mode mission
+    return run_mission(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
