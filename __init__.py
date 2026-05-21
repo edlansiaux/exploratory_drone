@@ -39,22 +39,22 @@ from .exploration import ExplorationMission, MissionConfig, SafetyScanner
 __all__ = [
     # Controller
     'TelloController',
-    
+
     # Vision
     'VideoStream',
-    'ObstacleDetector', 
+    'ObstacleDetector',
     'ThermalDetector',
-    
+
     # Mapping
     'DualMap',
     'ExplorationPlanner',
-    
+
     # Obstacle Avoidance
     'ObstacleAvoidanceSystem',
     'ReactiveAvoidance',
     'SafetyZone',
     'AvoidanceStrategy',
-    
+
     # Exploration
     'ExplorationMission',
     'MissionConfig',
