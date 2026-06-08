@@ -2,6 +2,11 @@
 """
 Contrôleur optimisé pour drone Tello EDU - Exploration de bâtiments
 Version avec gestion complète de l'orientation et mouvements sécurisés
+
+Réglages alignés sur le notebook de terrain (drone__1_.ipynb):
+  - Connexion par host explicite "192.168.10.1"
+  - Temporisation de stabilisation après streamon (2s)
+  - djitellopy >= 2.5.0
 """
 
 import time
@@ -13,6 +18,11 @@ from dataclasses import dataclass, field
 from threading import Lock
 
 logger = logging.getLogger(__name__)
+
+# Adresse IP par défaut du Tello en mode point d'accès (cf. notebook terrain)
+DEFAULT_TELLO_HOST = "192.168.10.1"
+# Délai de stabilisation après streamon avant lecture des frames (cf. notebook: "TRÈS IMPORTANT")
+STREAM_WARMUP_DELAY = 2.0
 
 
 class DroneState(Enum):
@@ -73,14 +83,16 @@ class TelloController:
     MAX_MOVE_DIST = 500     # cm
     MOVE_TIMEOUT = 15       # secondes
     
-    def __init__(self, simulation_mode: bool = False):
+    def __init__(self, simulation_mode: bool = False, host: str = DEFAULT_TELLO_HOST):
         """
         Initialise le contrôleur
         
         Args:
             simulation_mode: Si True, simule le drone sans connexion réelle
+            host: Adresse IP du drone (défaut 192.168.10.1, cf. notebook terrain)
         """
         self.simulation_mode = simulation_mode
+        self.host = host
         self.drone = None
         
         # État
@@ -101,7 +113,7 @@ class TelloController:
         self.on_low_battery = None
         self.on_position_update = None
         
-        logger.info(f"TelloController initialisé (simulation: {simulation_mode})")
+        logger.info(f"TelloController initialisé (simulation: {simulation_mode}, host: {host})")
     
     def connect(self) -> bool:
         """Connexion au drone"""
@@ -114,11 +126,13 @@ class TelloController:
                     return True
                 
                 from djitellopy import Tello
-                self.drone = Tello()
+                # Connexion par host explicite (cf. notebook terrain)
+                self.drone = Tello(host=self.host)
                 self.drone.connect()
                 
                 # Vérifier la batterie
                 battery = self.drone.get_battery()
+                logger.info(f"Niveau de batterie : {battery}%")
                 if battery < 10:
                     logger.error(f"Batterie critique: {battery}%")
                     return False
@@ -126,12 +140,55 @@ class TelloController:
                 self.state = DroneState.CONNECTED
                 self._update_telemetry()
                 
-                logger.info(f"Connecté - Batterie: {battery}%")
+                logger.info(f"Connecté ({self.host}) - Batterie: {battery}%")
                 return True
                 
             except Exception as e:
                 logger.error(f"Erreur connexion: {e}")
                 return False
+    
+    def start_video_stream(self) -> bool:
+        """
+        Active le flux vidéo du drone avec la temporisation de stabilisation.
+        Reproduit la séquence du notebook terrain:
+            drone.streamon(); time.sleep(2)  # TRÈS IMPORTANT
+        """
+        if self.simulation_mode:
+            return True
+        if not self.drone:
+            logger.warning("Drone non connecté, impossible de démarrer le flux")
+            return False
+        try:
+            self.drone.streamon()
+            time.sleep(STREAM_WARMUP_DELAY)  # Stabilisation flux (cf. notebook)
+            logger.info("Flux vidéo drone activé")
+            return True
+        except Exception as e:
+            logger.error(f"Erreur streamon: {e}")
+            return False
+    
+    def stop_video_stream(self):
+        """Coupe le flux vidéo du drone proprement."""
+        if self.simulation_mode or not self.drone:
+            return
+        try:
+            self.drone.streamoff()
+            logger.info("Flux vidéo drone coupé")
+        except Exception as e:
+            logger.warning(f"Erreur streamoff: {e}")
+    
+    def get_frame_reader(self):
+        """
+        Retourne le frame_reader djitellopy (BackgroundFrameRead).
+        À utiliser après start_video_stream(). Les frames sont en BGR.
+        """
+        if self.simulation_mode or not self.drone:
+            return None
+        try:
+            return self.drone.get_frame_read()
+        except Exception as e:
+            logger.error(f"Erreur get_frame_read: {e}")
+            return None
     
     def disconnect(self):
         """Déconnexion propre du drone"""
@@ -141,8 +198,13 @@ class TelloController:
             
             if self.drone and not self.simulation_mode:
                 try:
+                    # Couper le flux avant de fermer (cf. notebook: streamoff puis end)
+                    try:
+                        self.drone.streamoff()
+                    except Exception:
+                        pass
                     self.drone.end()
-                except:
+                except Exception:
                     pass
             
             self.state = DroneState.DISCONNECTED

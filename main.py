@@ -14,11 +14,15 @@ Usage:
 Exemples:
     python main.py --simulation --width 400 --height 400 --pattern spiral
     python main.py --simulation --duration 30 --altitude 120
+    python main.py --host 192.168.10.1       # Connexion drone par IP explicite
 """
 
 import argparse
 import sys
 import time
+
+from tello_controller import DEFAULT_TELLO_HOST
+
 
 def test_modules():
     """Test rapide de tous les modules."""
@@ -53,10 +57,10 @@ def test_modules():
         detector = ObstacleDetector()
         thermal = ThermalDetector()
         
-        # Frame test
-        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        # Frame test (résolution native Tello: 720x960)
+        frame = np.random.randint(0, 255, (720, 960, 3), dtype=np.uint8)
         obstacles = detector.detect(frame)
-        hotspots = thermal.detect(frame)
+        thermal_map, hotspots = thermal.detect(frame)
         
         print(f"   Obstacles détectés: {len(obstacles)}")
         print(f"   Hotspots détectés: {len(hotspots)}")
@@ -129,6 +133,7 @@ def test_modules():
         
         print(f"   Waypoints: {mission.total_waypoints}")
         print(f"   Pattern: {config.pattern}")
+        print(f"   Host configuré: {config.host}")
         print("   ✅ Exploration OK")
         results.append(("Exploration", True))
     except Exception as e:
@@ -175,7 +180,8 @@ def run_mission(args):
         scan_interval=args.scan_interval,
         safety_margin=args.safety_margin,
         min_battery=args.min_battery,
-        max_duration=args.max_duration
+        max_duration=args.max_duration,
+        host=args.host
     )
     
     print(f"\n📋 Configuration:")
@@ -183,23 +189,27 @@ def run_mission(args):
     print(f"   Altitude: {args.altitude} cm")
     print(f"   Pattern: {args.pattern}")
     print(f"   Mode: {'Simulation' if args.simulation else 'Réel'}")
+    if not args.simulation:
+        print(f"   Host drone: {args.host}")
     print(f"   Durée max: {args.duration}s")
     
     # Création mission
     mission = ExplorationMission(config, simulation_mode=args.simulation)
     
     # Callbacks
-    def on_status(status):
-        print(f"   📡 Status: {status}")
+    def on_status(old, new):
+        print(f"   📡 Status: {old.value} → {new.value}")
     
     def on_waypoint(wp, progress):
-        print(f"   📍 Waypoint {wp}: {progress:.1f}%")
+        print(f"   📍 Waypoint ({wp[0]:.0f}, {wp[1]:.0f}): {progress:.1f}%")
     
     def on_obstacle(obs):
-        print(f"   ⚠️  Obstacle: {obs.get('type', 'unknown')} à {obs.get('distance', '?')}cm")
+        otype = getattr(obs, 'obstacle_type', 'unknown')
+        odist = getattr(obs, 'distance', '?')
+        print(f"   ⚠️  Obstacle: {otype} à {odist}cm")
     
     def on_thermal(pos, temp, hotspots):
-        print(f"   🔥 Alerte thermique: {temp:.1f}°C à position {pos}")
+        print(f"   🔥 Alerte thermique: {temp:.1f}°C à ({pos.x:.0f}, {pos.y:.0f})")
     
     mission.on_status_change = on_status
     mission.on_waypoint_reached = on_waypoint
@@ -212,7 +222,7 @@ def run_mission(args):
         print("❌ Échec de la préparation")
         return 1
     
-    print(f"   Waypoints planifiés: {len(mission.waypoints)}")
+    print(f"   Waypoints planifiés: {mission.total_waypoints}")
     
     # Ajout obstacles simulés (mode simulation uniquement)
     if args.simulation:
@@ -232,13 +242,12 @@ def run_mission(args):
     try:
         while time.time() - start_time < args.duration:
             elapsed = time.time() - start_time
-            remaining = args.duration - elapsed
             
             # Affichage périodique
             if int(elapsed) % 5 == 0 and elapsed > 0:
                 report = mission.get_mission_report()
-                coverage = report.get('map_coverage', 0)
-                battery = report.get('battery', 100)
+                coverage = report['mapping']['coverage']
+                battery = report['drone']['battery']
                 print(f"\n   ⏱️  {int(elapsed)}s | Couverture: {coverage:.1f}% | Batterie: {battery}%")
             
             time.sleep(1)
@@ -258,21 +267,21 @@ def run_mission(args):
     report = mission.get_mission_report()
     
     print(f"\n📈 Progression:")
-    print(f"   Waypoints: {report.get('waypoints_completed', 0)}/{report.get('waypoints_total', 0)}")
-    print(f"   Couverture: {report.get('map_coverage', 0):.1f}%")
+    print(f"   Waypoints: {report['waypoints']['completed']}/{report['waypoints']['total']}")
+    print(f"   Couverture: {report['mapping']['coverage']:.1f}%")
     
     print(f"\n🚧 Obstacles:")
-    print(f"   Détectés: {report.get('obstacles_detected', 0)}")
-    print(f"   Collisions évitées: {report.get('collisions_avoided', 0)}")
+    print(f"   Surveillés: {report['avoidance']['total_obstacles']}")
+    print(f"   Collisions évitées: {report['avoidance']['stats']['collisions_avoided']}")
     
     print(f"\n🌡️  Thermique:")
-    print(f"   Température max: {report.get('max_temperature', 20):.1f}°C")
-    print(f"   Zones chaudes: {report.get('thermal_zones', 0)}")
-    print(f"   Feu détecté: {'Oui 🔥' if report.get('fire_detected', False) else 'Non'}")
+    print(f"   Température max: {report['thermal']['max_temperature']:.1f}°C")
+    print(f"   Zones chaudes: {report['thermal']['zones']}")
+    print(f"   Feu détecté: {'Oui 🔥' if report['thermal']['fire_detected'] else 'Non'}")
     
     print(f"\n🔋 Télémétrie:")
-    print(f"   Batterie: {report.get('battery', 100)}%")
-    print(f"   Durée: {report.get('duration', 0):.1f}s")
+    print(f"   Batterie: {report['drone']['battery']}%")
+    print(f"   Durée: {report['duration_seconds']:.1f}s")
     
     # Affichage carte
     if args.show_map:
@@ -304,6 +313,7 @@ Exemples:
   python main.py --simulation                    Mode simulation rapide
   python main.py --simulation --duration 60      Simulation 60 secondes
   python main.py --simulation --pattern spiral   Pattern spirale
+  python main.py --host 192.168.10.1             Connexion drone par IP
   python main.py --test                          Test des modules
         """
     )
@@ -313,6 +323,10 @@ Exemples:
                         help='Mode simulation (sans drone)')
     parser.add_argument('--test', '-t', action='store_true',
                         help='Test rapide des modules')
+    
+    # Connexion drone
+    parser.add_argument('--host', type=str, default=DEFAULT_TELLO_HOST,
+                        help=f'Adresse IP du drone (défaut: {DEFAULT_TELLO_HOST})')
     
     # Zone
     parser.add_argument('--width', '-W', type=int, default=300,

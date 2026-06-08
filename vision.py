@@ -2,6 +2,12 @@
 """
 Module de vision optimisé pour Tello EDU - Exploration de bâtiments
 Inclut détection d'obstacles et simulation thermique
+
+Réglages alignés sur le notebook de terrain (drone__1_.ipynb):
+  - Résolution réelle de la caméra Tello: 960x720 (largeur x hauteur)
+    => frame numpy de shape (720, 960, 3)
+  - Séquence flux réel: streamon() puis time.sleep(2) AVANT get_frame_read()
+  - Les frames du drone sont en BGR (conversion BGR->RGB pour affichage uniquement)
 """
 
 import cv2
@@ -15,6 +21,9 @@ from collections import deque
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+# Délai de stabilisation après streamon avant lecture des frames (cf. notebook: "TRÈS IMPORTANT")
+STREAM_WARMUP_DELAY = 2.0
 
 
 class ObstacleType(Enum):
@@ -86,6 +95,10 @@ class VideoStream:
     Support caméra Tello et simulation
     """
     
+    # Résolution native de la caméra Tello: largeur=960, hauteur=720
+    # (cf. notebook: frame_reader.frame de shape (720, 960, 3))
+    DEFAULT_FRAME_SIZE = (960, 720)  # (width, height)
+    
     def __init__(self, drone=None, simulation_mode: bool = False):
         self.drone = drone
         self.simulation_mode = simulation_mode
@@ -94,7 +107,8 @@ class VideoStream:
         self.current_frame: Optional[np.ndarray] = None
         self.frame_count = 0
         self.fps = 0
-        self.frame_size = (960, 720)
+        # (width, height) - cohérent avec la résolution réelle du Tello
+        self.frame_size = self.DEFAULT_FRAME_SIZE
         
         self._capture_thread: Optional[threading.Thread] = None
         self._stop_capture = threading.Event()
@@ -102,11 +116,13 @@ class VideoStream:
         
         self.frame_buffer: deque = deque(maxlen=30)
         self._sim_cap: Optional[cv2.VideoCapture] = None
+        self._frame_reader = None  # BackgroundFrameRead djitellopy
         
         # Callbacks
         self.on_frame_received: Optional[Callable] = None
         
-        logger.info(f"VideoStream initialisé (simulation: {simulation_mode})")
+        logger.info(f"VideoStream initialisé (simulation: {simulation_mode}, "
+                    f"résolution: {self.frame_size[0]}x{self.frame_size[1]})")
     
     def start(self) -> bool:
         """Démarre le flux vidéo"""
@@ -121,8 +137,12 @@ class VideoStream:
                     self._sim_cap = None
             else:
                 if self.drone:
+                    # Séquence du notebook terrain: streamon puis attente de stabilisation
                     self.drone.streamon()
-                    time.sleep(2)
+                    time.sleep(STREAM_WARMUP_DELAY)  # TRÈS IMPORTANT (cf. notebook)
+                    # Récupérer le frame reader une fois le flux stabilisé
+                    self._frame_reader = self.drone.get_frame_read()
+                    time.sleep(0.5)
             
             self._stop_capture.clear()
             self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
@@ -151,6 +171,7 @@ class VideoStream:
             except:
                 pass
         
+        self._frame_reader = None
         self.is_streaming = False
         logger.info("Flux vidéo arrêté")
     
@@ -186,7 +207,7 @@ class VideoStream:
                 time.sleep(0.1)
     
     def _get_frame(self) -> Optional[np.ndarray]:
-        """Récupère une frame"""
+        """Récupère une frame (BGR)"""
         if self.simulation_mode:
             if self._sim_cap and self._sim_cap.isOpened():
                 ret, frame = self._sim_cap.read()
@@ -194,6 +215,10 @@ class VideoStream:
                     return cv2.resize(frame, self.frame_size)
             return self._generate_synthetic_frame()
         else:
+            # Lecture via le frame reader obtenu après streamon + sleep(2)
+            if self._frame_reader is not None:
+                frame = self._frame_reader.frame
+                return frame
             if self.drone:
                 return self.drone.get_frame_read().frame
         return None
@@ -274,9 +299,19 @@ class VideoStream:
         return frame
     
     def get_frame(self) -> Optional[np.ndarray]:
-        """Retourne la frame courante"""
+        """Retourne la frame courante (BGR)"""
         with self._frame_lock:
             return self.current_frame.copy() if self.current_frame is not None else None
+    
+    def get_frame_rgb(self) -> Optional[np.ndarray]:
+        """
+        Retourne la frame courante convertie en RGB (pour affichage matplotlib/notebook).
+        Reproduit cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) du notebook terrain.
+        """
+        frame = self.get_frame()
+        if frame is None:
+            return None
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
     def get_recent_frames(self, n: int = 10) -> List[Tuple[np.ndarray, float]]:
         """Retourne les n dernières frames"""
@@ -896,7 +931,7 @@ if __name__ == "__main__":
             obstacles = detector.detect(frame)
             thermal_map, hotspots = thermal.detect(frame)
             
-            print(f"Frame {i+1}:")
+            print(f"Frame {i+1}: shape={frame.shape}")
             print(f"  - Obstacles: {len(obstacles)}")
             print(f"  - Points chauds: {len(hotspots)}")
             print(f"  - Temp max: {thermal.get_max_temperature():.1f}°C")

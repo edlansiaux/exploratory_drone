@@ -2,6 +2,10 @@
 """
 Module d'exploration autonome optimisé pour Tello EDU
 Exploration de bâtiments délabrés avec cartographie thermique
+
+Réglages alignés sur le notebook de terrain (drone__1_.ipynb):
+  - host drone "192.168.10.1" propagé au contrôleur
+  - VideoStream relié à l'objet drone réel (streamon + sleep(2) + get_frame_read)
 """
 
 import time
@@ -12,7 +16,7 @@ from typing import Tuple, Optional, List, Callable
 from enum import Enum
 from dataclasses import dataclass
 
-from tello_controller import TelloController, DroneState, Position
+from tello_controller import TelloController, DroneState, Position, DEFAULT_TELLO_HOST
 from mapping import DualMap, ExplorationPlanner, Obstacle
 from obstacle_avoidance import (
     ObstacleAvoidanceSystem,
@@ -66,6 +70,9 @@ class MissionConfig:
     # Sécurité
     scan_interval: float = 300.0        # cm (scan 360° tous les 3m)
     safety_margin: float = 80.0         # cm
+    
+    # Connexion drone (cf. notebook terrain)
+    host: str = DEFAULT_TELLO_HOST
     
     # Fonctionnalités
     enable_mapping: bool = True
@@ -223,7 +230,7 @@ class ExplorationMission:
         self.simulation_mode = simulation_mode
         
         # Composants principaux
-        self.controller = TelloController(simulation_mode)
+        self.controller = TelloController(simulation_mode, host=self.config.host)
         self.dual_map = DualMap(
             resolution=self.config.step_size,
             size=(self.config.area_width, self.config.area_height)
@@ -239,6 +246,7 @@ class ExplorationMission:
         self.reactive = ReactiveAvoidance(emergency_distance=35)
         
         # Vision
+        # Le drone réel sera relié au VideoStream lors de prepare_mission()
         self.video_stream = VideoStream(simulation_mode=simulation_mode)
         self.obstacle_detector = ObstacleDetector()
         self.thermal_detector = ThermalDetector()
@@ -314,6 +322,10 @@ class ExplorationMission:
             self._set_status(MissionStatus.ABORTED)
             return False
         
+        # Relier le drone réel au flux vidéo (pour streamon/get_frame_read)
+        if not self.simulation_mode:
+            self.video_stream.drone = self.controller.drone
+        
         # Vérification batterie
         telemetry = self.controller.get_telemetry()
         if telemetry.get('battery', 0) < self.config.min_battery:
@@ -321,7 +333,7 @@ class ExplorationMission:
             self._set_status(MissionStatus.ABORTED)
             return False
         
-        # Démarrage vidéo
+        # Démarrage vidéo (streamon + sleep(2) + get_frame_read en mode réel)
         if self.config.enable_mapping or self.config.enable_thermal:
             self.video_stream.start()
             time.sleep(1)
