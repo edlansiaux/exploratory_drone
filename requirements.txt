@@ -1,8 +1,8 @@
 # Tello Explorer - Dépendances Python
 # Installation: pip install -r requirements.txt
 
-# SDK Drone Tello
-djitellopy>=2.4.0
+# SDK Drone Tello (version validée sur le terrain - cf. notebook)
+djitellopy>=2.5.0
 
 # Traitement d'images et vision
 opencv-python>=4.5.0
