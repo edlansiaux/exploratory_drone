@@ -190,7 +190,7 @@ def run_mission(args):
     print(f"   Pattern: {args.pattern}")
     print(f"   Mode: {'Simulation' if args.simulation else 'Réel'}")
     if not args.simulation:
-        print(f"   Host drone: {args.host}")
+        print(f"   Host drone: {args.host if args.host else 'auto (192.168.10.1)'}")
     print(f"   Durée max: {args.duration}s")
     
     # Création mission
@@ -325,8 +325,9 @@ Exemples:
                         help='Test rapide des modules')
     
     # Connexion drone
-    parser.add_argument('--host', type=str, default=DEFAULT_TELLO_HOST,
-                        help=f'Adresse IP du drone (défaut: {DEFAULT_TELLO_HOST})')
+    parser.add_argument('--host', type=str, default=None,
+                        help='Adresse IP du drone. Par défaut: auto (192.168.10.1 '
+                             'en mode point d\'accès). À renseigner seulement en mode station.')
     
     # Zone
     parser.add_argument('--width', '-W', type=int, default=300,

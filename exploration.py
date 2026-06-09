@@ -71,14 +71,20 @@ class MissionConfig:
     scan_interval: float = 300.0        # cm (scan 360° tous les 3m)
     safety_margin: float = 80.0         # cm
     
-    # Connexion drone (cf. notebook terrain)
-    host: str = DEFAULT_TELLO_HOST
+    # Connexion drone. None => défaut djitellopy (192.168.10.1), recommandé en
+    # mode point d'accès. Ne renseigner que pour un Tello en mode station.
+    host: Optional[str] = None
     
     # Fonctionnalités
     enable_mapping: bool = True
     enable_thermal: bool = True
     enable_avoidance: bool = True
     enable_scanning: bool = True
+
+    # Robustesse vol réel
+    max_consecutive_failures: int = 5   # abandon mission après N échecs de mouvement d'affilée
+    require_imu_ready: bool = True      # refuser le décollage si l'IMU n'est pas prêt
+    move_settle_time: float = 1.5       # pause (s) après chaque mouvement pour reverrouiller l'IMU
 
 
 class SafetyScanner:
@@ -225,12 +231,13 @@ class ExplorationMission:
     Navigation sécurisée avec scans périodiques et cartographie thermique
     """
     
-    def __init__(self, config: MissionConfig = None, simulation_mode: bool = False):
+    def __init__(self, config: MissionConfig = None, simulation_mode: bool = False,
+                 drone=None):
         self.config = config or MissionConfig()
         self.simulation_mode = simulation_mode
         
         # Composants principaux
-        self.controller = TelloController(simulation_mode, host=self.config.host)
+        self.controller = TelloController(simulation_mode, host=self.config.host, drone=drone)
         self.dual_map = DualMap(
             resolution=self.config.step_size,
             size=(self.config.area_width, self.config.area_height)
@@ -265,6 +272,8 @@ class ExplorationMission:
         self.waypoints_completed = 0
         self.total_waypoints = 0
         self.distance_since_scan = 0.0
+        self.consecutive_failures = 0   # échecs de mouvement consécutifs (vol réel)
+        self._abort_reason: Optional[str] = None
         
         # Threads
         self._exploration_thread: Optional[threading.Thread] = None
@@ -328,10 +337,16 @@ class ExplorationMission:
         
         # Vérification batterie
         telemetry = self.controller.get_telemetry()
-        if telemetry.get('battery', 0) < self.config.min_battery:
-            logger.error(f"Batterie insuffisante: {telemetry.get('battery')}%")
+        battery = telemetry.get('battery', 0)
+        if battery < self.config.min_battery:
+            logger.error(f"Batterie insuffisante: {battery}%")
             self._set_status(MissionStatus.ABORTED)
             return False
+        if battery < 30:
+            logger.warning(
+                f"Batterie faible ({battery}%): le Tello devient instable "
+                "(risque accru de 'No valid imu'). Recharge recommandée avant un vol complet."
+            )
         
         # Démarrage vidéo (streamon + sleep(2) + get_frame_read en mode réel)
         if self.config.enable_mapping or self.config.enable_thermal:
@@ -373,11 +388,33 @@ class ExplorationMission:
             if not self.controller.takeoff():
                 self._set_status(MissionStatus.ABORTED)
                 return False
-            
-            # Altitude d'exploration
+
+            # Laisser le drone stabiliser son positionnement après décollage
+            time.sleep(self.config.move_settle_time)
+
+            # Sonde IMU active : la montée à l'altitude d'exploration sert de test réel.
+            # Si elle échoue (typiquement 'error No valid imu'), on abandonne tout de
+            # suite plutôt que d'enchaîner scan + navigation qui échoueront aussi.
             alt_diff = self.config.exploration_altitude - self.controller.position.z
-            if alt_diff > 20:
+            if self.config.require_imu_ready and alt_diff > 20:
+                if not self.controller.move_up(int(alt_diff)):
+                    logger.error(
+                        "Montée initiale impossible (probable 'No valid imu'). "
+                        "Vérifie: sol MAT et TEXTURÉ, bon éclairage, batterie suffisante, "
+                        "calibration IMU. Atterrissage de sécurité."
+                    )
+                    self._abort_reason = "imu_not_ready"
+                    self.controller.land()
+                    if self.config.enable_avoidance:
+                        self.avoidance.stop_monitoring()
+                    self.video_stream.stop()
+                    self._set_status(MissionStatus.ABORTED)
+                    return False
+                time.sleep(self.config.move_settle_time)
+            elif alt_diff > 20:
+                # require_imu_ready désactivé : montée best-effort sans abandon
                 self.controller.move_up(int(alt_diff))
+                time.sleep(self.config.move_settle_time)
         
         # Scan initial 360°
         if self.config.enable_scanning:
@@ -486,12 +523,37 @@ class ExplorationMission:
             
             if success:
                 self.waypoints_completed += 1
+                self.consecutive_failures = 0   # reset sur succès
                 self._record_data()
                 
                 if self.on_waypoint_reached:
                     self.on_waypoint_reached(waypoint, self.planner.get_progress())
+            else:
+                # Échec de navigation: incrémenter le compteur et avorter si trop d'échecs
+                self.consecutive_failures += 1
+                logger.warning(
+                    f"Échec navigation ({self.consecutive_failures}/"
+                    f"{self.config.max_consecutive_failures})"
+                )
+                if self.consecutive_failures >= self.config.max_consecutive_failures:
+                    logger.error(
+                        "Trop d'échecs consécutifs (probable 'No valid imu' ou perte "
+                        "réseau). Abandon de la mission et atterrissage."
+                    )
+                    self._abort_reason = "too_many_failures"
+                    break
             
             time.sleep(0.1)
+        
+        # Atterrissage automatique si la boucle s'est arrêtée sur un abandon
+        if self._abort_reason == "too_many_failures":
+            try:
+                self.avoidance.stop_monitoring()
+            except Exception:
+                pass
+            logger.info("Atterrissage de sécurité suite à l'abandon")
+            self.controller.land()
+            self._set_status(MissionStatus.ABORTED)
         
         logger.info("Boucle d'exploration terminée")
     
@@ -587,7 +649,8 @@ class ExplorationMission:
                 logger.warning("Blocage détecté")
                 return False
             
-            time.sleep(0.2)
+            # Pause de stabilisation (laisse l'IMU se reverrouiller en vol réel)
+            time.sleep(self.config.move_settle_time if not self.simulation_mode else 0.2)
         
         return True
     
@@ -733,6 +796,8 @@ class ExplorationMission:
         
         return {
             'status': self.status.value,
+            'abort_reason': self._abort_reason,
+            'consecutive_failures': self.consecutive_failures,
             'mode': self.mode.value,
             'duration_seconds': elapsed,
             'simulation': self.simulation_mode,

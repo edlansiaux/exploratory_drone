@@ -83,17 +83,24 @@ class TelloController:
     MAX_MOVE_DIST = 500     # cm
     MOVE_TIMEOUT = 15       # secondes
     
-    def __init__(self, simulation_mode: bool = False, host: str = DEFAULT_TELLO_HOST):
+    def __init__(self, simulation_mode: bool = False,
+                 host: Optional[str] = None, drone=None):
         """
         Initialise le contrôleur
         
         Args:
             simulation_mode: Si True, simule le drone sans connexion réelle
-            host: Adresse IP du drone (défaut 192.168.10.1, cf. notebook terrain)
+            host: Adresse IP du drone. Si None (recommandé en mode point d'accès),
+                  djitellopy utilise son défaut (192.168.10.1). Ne renseigner que
+                  pour un Tello en mode station sur un réseau domestique.
+            drone: Instance djitellopy.Tello DÉJÀ connectée à réutiliser. Évite
+                   d'ouvrir un second socket UDP (le Tello n'accepte qu'un client).
         """
         self.simulation_mode = simulation_mode
         self.host = host
-        self.drone = None
+        # Réutilisation d'une instance Tello existante (déjà connectée)
+        self.drone = drone
+        self._external_drone = drone is not None
         
         # État
         self.state = DroneState.DISCONNECTED
@@ -113,7 +120,9 @@ class TelloController:
         self.on_low_battery = None
         self.on_position_update = None
         
-        logger.info(f"TelloController initialisé (simulation: {simulation_mode}, host: {host})")
+        host_label = self.host if self.host else "défaut djitellopy (192.168.10.1)"
+        reuse = " [instance réutilisée]" if self._external_drone else ""
+        logger.info(f"TelloController initialisé (simulation: {simulation_mode}, host: {host_label}){reuse}")
     
     def connect(self) -> bool:
         """Connexion au drone"""
@@ -126,11 +135,19 @@ class TelloController:
                     return True
                 
                 from djitellopy import Tello
-                # Connexion par host explicite (cf. notebook terrain)
-                self.drone = Tello(host=self.host)
-                self.drone.connect()
+                if self.drone is None:
+                    # Créer l'instance. host=None => défaut djitellopy (192.168.10.1)
+                    if self.host:
+                        self.drone = Tello(host=self.host)
+                    else:
+                        self.drone = Tello()
+                    self.drone.connect()
+                else:
+                    # Instance déjà fournie (réutilisée). On vérifie qu'elle répond
+                    # sans rouvrir de socket ; un get_battery sert de ping applicatif.
+                    logger.info("Réutilisation d'une instance Tello existante")
                 
-                # Vérifier la batterie
+                # Vérifier la batterie (sert aussi de test de communication)
                 battery = self.drone.get_battery()
                 logger.info(f"Niveau de batterie : {battery}%")
                 if battery < 10:
@@ -140,7 +157,8 @@ class TelloController:
                 self.state = DroneState.CONNECTED
                 self._update_telemetry()
                 
-                logger.info(f"Connecté ({self.host}) - Batterie: {battery}%")
+                conn_host = self.host if self.host else "192.168.10.1"
+                logger.info(f"Connecté ({conn_host}) - Batterie: {battery}%")
                 return True
                 
             except Exception as e:
@@ -203,7 +221,10 @@ class TelloController:
                         self.drone.streamoff()
                     except Exception:
                         pass
-                    self.drone.end()
+                    # Ne fermer le socket que si nous l'avons ouvert nous-mêmes.
+                    # Une instance fournie de l'extérieur reste gérée par l'appelant.
+                    if not self._external_drone:
+                        self.drone.end()
                 except Exception:
                     pass
             
@@ -256,6 +277,36 @@ class TelloController:
             'yaw': self.position.yaw,
             'state': self.state.value
         }
+
+    def is_imu_ready(self) -> bool:
+        """
+        Vérifie sommairement que le positionnement (IMU + caméra ventrale) est
+        exploitable. Un Tello au-dessus d'un sol non texturé ou mal éclairé
+        renvoie 'error No valid imu' sur les déplacements; cette vérification
+        tente de l'anticiper en lisant l'accélération rapportée par le drone.
+
+        Retourne True en simulation. En réel, retourne False si les valeurs
+        d'accélération sont toutes nulles/indisponibles (signe d'un état non prêt).
+        """
+        if self.simulation_mode:
+            return True
+        if not self.drone:
+            return False
+        try:
+            # djitellopy expose get_acceleration_x/y/z (mg) à partir du state.
+            ax = self.drone.get_acceleration_x()
+            ay = self.drone.get_acceleration_y()
+            az = self.drone.get_acceleration_z()
+            # Au repos, az ~ -1000 mg (gravité). Si tout est exactement 0, le
+            # state n'est pas alimenté => positionnement non prêt.
+            if ax == 0 and ay == 0 and az == 0:
+                logger.warning("IMU non prêt: accélérations nulles (positionnement indisponible)")
+                return False
+            return True
+        except Exception as e:
+            logger.warning(f"Lecture état IMU impossible: {e}")
+            # En cas de doute, ne pas bloquer la mission sur cette base seule.
+            return True
     
     def takeoff(self) -> bool:
         """Décollage sécurisé"""
@@ -280,27 +331,48 @@ class TelloController:
                 logger.error(f"Erreur décollage: {e}")
                 return False
     
-    def land(self) -> bool:
-        """Atterrissage sécurisé"""
+    def land(self, retries: int = 3) -> bool:
+        """
+        Atterrissage sécurisé avec plusieurs tentatives.
+
+        En cas de liaison Wi-Fi instable (WinError 10051), on retente le 'land'
+        plusieurs fois. Note de sécurité: le firmware Tello déclenche de toute
+        façon un auto-land après ~15s sans commande reçue.
+
+        Args:
+            retries: nombre de tentatives d'envoi de la commande land
+        """
         with self._lock:
             if self.state != DroneState.FLYING:
                 return True
-            
-            try:
-                self.state = DroneState.LANDING
-                
-                if not self.simulation_mode:
-                    self.drone.land()
-                
+
+            self.state = DroneState.LANDING
+
+            if self.simulation_mode:
                 self.position.z = 0
                 self.state = DroneState.CONNECTED
-                
                 logger.info("Atterrissage réussi")
                 return True
-                
-            except Exception as e:
-                logger.error(f"Erreur atterrissage: {e}")
-                return False
+
+            last_err = None
+            for attempt in range(1, retries + 1):
+                try:
+                    self.drone.land()
+                    self.position.z = 0
+                    self.state = DroneState.CONNECTED
+                    logger.info(f"Atterrissage réussi (tentative {attempt})")
+                    return True
+                except Exception as e:
+                    last_err = e
+                    logger.error(f"Erreur atterrissage (tentative {attempt}/{retries}): {e}")
+                    time.sleep(1.0)
+
+            logger.critical(
+                "ÉCHEC ATTERRISSAGE après %d tentatives (%s). "
+                "Le Tello devrait auto-atterrir après ~15s sans commande.",
+                retries, last_err
+            )
+            return False
     
     def emergency_stop(self):
         """Arrêt d'urgence - coupe les moteurs"""
